@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "hypothesis"]
+dev = ["pytest", "hypothesis", "openai"]
 gpu = ["triton>=3.0"]
 
 [tool.setuptools.packages.find]

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "layover"
+version = "0.1.0"
+description = "Agent-aware LLM inference engine with per-tool-call KV cache placement"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.5",
+    "transformers>=4.51",
+    "safetensors",
+    "huggingface_hub",
+    "numpy",
+    "matplotlib",
+    "fastapi",
+    "uvicorn",
+    "httpx",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "hypothesis"]
+gpu = ["triton>=3.0"]
+
+[tool.setuptools.packages.find]
+include = ["layover*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "gpu: needs a CUDA GPU; enable with --gpu",
+]

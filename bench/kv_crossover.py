@@ -5,6 +5,8 @@ For each context length this records:
   * swap-out: copy every K and V tensor from the device to pinned CPU memory
   * swap-in:  copy them back
   * recompute: chunked prefill from token ids, which is what a dropped cache costs
+    (through the engine by default; --backend hf times transformers instead, whose
+    cache concatenates on every chunk and so overstates the cost)
 
 The output is a CSV, a plot, and cost_model.json, the fit that the agent cost
 model in layover.agent.cost_model loads. Only a run on a CUDA device gives numbers
@@ -35,6 +37,7 @@ from layover.config import ModelConfig  # noqa: E402
 DEFAULT_TOKENS = [512, 1024, 2048, 4096, 8192, 16384, 32768]
 CPU_SMOKE_TOKENS = [64, 128, 256, 512, 1024]
 BIT_VIEWS = {1: torch.uint8, 2: torch.uint16, 4: torch.uint32}
+DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
 
 @dataclass
@@ -97,6 +100,32 @@ def hf_prefill(model, ids: torch.Tensor, chunk: int) -> list[torch.Tensor]:
     return [t for layer in cache.layers for t in (layer.keys, layer.values)]
 
 
+def load_layover_model(name: str, device: torch.device, dtype: torch.dtype, seed: int):
+    from layover.model import Qwen3
+    from layover.weights import load_model
+
+    if name == "micro":
+        cfg = ModelConfig.micro()
+        torch.manual_seed(seed)
+        return cfg, Qwen3(cfg).to(dtype=dtype, device=device).eval()
+    model = load_model(name, device=device, dtype=dtype)
+    return model.cfg, model
+
+
+def layover_prefill(model, ids: torch.Tensor, chunk: int, dtype: torch.dtype) -> list[torch.Tensor]:
+    """Chunked prefill through the engine, which is what a dropped cache really costs."""
+    from layover.kv import BlockTable, PagedKVCache
+
+    tokens = ids.shape[1]
+    if tokens % 16:
+        raise ValueError("the layover backend measures whole 16-token blocks")
+    cache = PagedKVCache(model.cfg, tokens // 16, ids.device, dtype)
+    table = BlockTable()
+    for start in range(0, tokens, chunk):
+        model.prefill(cache, table, ids[0, start : start + chunk], start)
+    return [cache.pool]
+
+
 def make_ids(cfg: ModelConfig, tokens: int, device: torch.device, seed: int) -> torch.Tensor:
     gen = torch.Generator().manual_seed(seed + tokens)
     return torch.randint(0, cfg.vocab_size, (1, tokens), generator=gen).to(device)
@@ -136,7 +165,11 @@ def measure(model, cfg, tokens, args, device) -> Row:
     out_samples, in_samples, recompute_samples = [], [], []
     for i in range(args.warmup + args.repeats):
         holder: list[list[torch.Tensor]] = []
-        recompute_s = timed(device, lambda: holder.append(hf_prefill(model, ids, args.chunk)))
+        if args.backend == "layover":
+            prefill = lambda: holder.append(layover_prefill(model, ids, args.chunk, DTYPES[args.dtype]))  # noqa: E731
+        else:
+            prefill = lambda: holder.append(hf_prefill(model, ids, args.chunk))  # noqa: E731
+        recompute_s = timed(device, prefill)
         kv = holder[0]
         if sum(t.numel() for t in kv) * kv[0].element_size() != tokens * cfg.kv_bytes_per_token(args.dtype):
             raise RuntimeError("measured KV size disagrees with the config-derived size")
@@ -273,6 +306,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--model", default="micro", help="'micro', a hub id, or a local checkpoint")
     p.add_argument("--device", default="cpu", choices=["cpu", "mps", "cuda"])
     p.add_argument("--dtype", default="bf16", choices=["bf16", "fp16"])
+    p.add_argument("--backend", default="layover", choices=["layover", "hf"], help="whose prefill to time")
     p.add_argument("--tokens", type=int, nargs="+", help="context lengths to measure")
     p.add_argument("--chunk", type=int, default=1024, help="prefill chunk size")
     p.add_argument("--repeats", type=int, default=5)
@@ -288,9 +322,10 @@ def main(argv=None) -> dict:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise SystemExit("--device cuda requested but no CUDA GPU is available")
     tokens = args.tokens or (DEFAULT_TOKENS if device.type == "cuda" else CPU_SMOKE_TOKENS)
-    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
+    dtype = DTYPES[args.dtype]
 
-    cfg, model = load_hf_model(args.model, device, dtype, args.seed)
+    loader = load_layover_model if args.backend == "layover" else load_hf_model
+    cfg, model = loader(args.model, device, dtype, args.seed)
     too_long = [t for t in tokens if t > cfg.max_position_embeddings]
     if too_long:
         raise SystemExit(f"{too_long} exceed max_position_embeddings={cfg.max_position_embeddings}")
@@ -309,6 +344,7 @@ def main(argv=None) -> dict:
     meta = {
         "model": args.model,
         "dtype": args.dtype,
+        "backend": args.backend,
         "device": args.device,
         "device_name": device_name(device),
         "measured_on_gpu": device.type == "cuda",

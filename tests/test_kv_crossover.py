@@ -73,6 +73,27 @@ def test_chunking_does_not_change_kv():
         assert torch.allclose(a, b, atol=1e-4)
 
 
+def test_engine_and_hf_backends_produce_the_same_kv():
+    cfg, hf = kv.load_hf_model("micro", torch.device("cpu"), torch.float32, 0)
+    _, ours = kv.load_layover_model("micro", torch.device("cpu"), torch.float32, 0)
+    ours.load_state_dict(hf.state_dict())
+    ids = kv.make_ids(cfg, 48, torch.device("cpu"), 2)
+    pool = kv.layover_prefill(ours, ids, 16, torch.float32)[0]
+    assert pool.numel() * 2 == 48 * cfg.kv_bytes_per_token("bf16")
+    reference = kv.hf_prefill(hf, ids, 48)
+    # The pool is [block, kind, layer, head, slot, dim]; blocks fill from block 0.
+    rebuilt = pool.permute(2, 1, 3, 0, 4, 5).flatten(3, 4)
+    for layer in range(cfg.num_hidden_layers):
+        assert torch.allclose(rebuilt[layer, 0], reference[2 * layer][0], atol=1e-4)
+        assert torch.allclose(rebuilt[layer, 1], reference[2 * layer + 1][0], atol=1e-4)
+
+
+def test_layover_backend_rejects_partial_blocks():
+    cfg, model = kv.load_layover_model("micro", torch.device("cpu"), torch.float32, 0)
+    with pytest.raises(ValueError):
+        kv.layover_prefill(model, kv.make_ids(cfg, 40, torch.device("cpu"), 0), 16, torch.float32)
+
+
 def test_checksum_detects_a_flipped_value():
     a = [torch.ones(4, 4, dtype=torch.bfloat16)]
     b = [a[0].clone()]
@@ -98,11 +119,12 @@ def test_crossover_outcomes():
     assert 100 < found["crossover_tokens"] < 400
 
 
-def test_end_to_end_writes_labelled_outputs(tmp_path):
+@pytest.mark.parametrize("backend", ["layover", "hf"])
+def test_end_to_end_writes_labelled_outputs(tmp_path, backend):
     meta = kv.main(
-        ["--tokens", "32", "64", "128", "--repeats", "2", "--chunk", "32", "--out", str(tmp_path)]
+        ["--tokens", "32", "64", "128", "--repeats", "2", "--chunk", "32", "--backend", backend, "--out", str(tmp_path)]
     )
-    assert meta["measured_on_gpu"] is False
+    assert meta["measured_on_gpu"] is False and meta["backend"] == backend
     saved = json.loads((tmp_path / "cost_model.json").read_text())
     assert saved["kv_bytes_per_token"] == ModelConfig.micro().kv_bytes_per_token("bf16")
     with (tmp_path / "kv_crossover.csv").open() as f:

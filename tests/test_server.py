@@ -10,13 +10,15 @@ import pytest
 import torch
 import uvicorn
 
-from layover.agent.cost_model import CostModel
+from layover.agent.cost_model import CostModel, Policy
 from layover.agent.scheduler import AgentConfig, AgentScheduler
 from layover.config import ModelConfig
 from layover.engine import Engine, EngineConfig, Request
 from layover.kv import PagedKVCache
 from layover.model import Qwen3
-from layover.server import EngineLoop, HFTokenizer, create_app, parse_tool_calls
+from layover.kernels.fp8 import Fp8Layout
+from layover.kv.transfer import NativeBackend
+from layover.server import EngineLoop, HFTokenizer, cpu_tier_capacity_blocks, create_app, parse_tool_calls
 
 CFG = ModelConfig.micro()
 COSTS = CostModel([0.001, 5e-6], [0.001, 5e-6], [0.005, 2e-5, 2e-9])
@@ -39,9 +41,9 @@ class ByteTokenizer:
 
 
 class Served:
-    def __init__(self, model, tokenizer, name, blocks=128, dtype=torch.float32, agent=AgentConfig()):
+    def __init__(self, model, tokenizer, name, blocks=128, dtype=torch.float32, agent=AgentConfig(), transfer=None):
         cache = PagedKVCache(model.cfg, blocks, dtype=dtype)
-        self.scheduler = AgentScheduler(model, cache, COSTS, EngineConfig(max_batch=4, prefill_chunk=32, prefill_budget=64), agent)
+        self.scheduler = AgentScheduler(model, cache, COSTS, EngineConfig(max_batch=4, prefill_chunk=32, prefill_budget=64), agent, transfer=transfer)
         self.loop = EngineLoop(self.scheduler)
         self.loop.start()
         with socket.socket() as probe:
@@ -196,6 +198,44 @@ def test_metrics_and_models(api):
     assert api.client.get("/health").json() == {"status": "ok"}
 
 
+def test_cpu_tier_budget_is_bytes_so_fp8_holds_about_twice_the_tokens():
+    cache = PagedKVCache(ModelConfig.micro(), 8, dtype=torch.bfloat16)
+    gib = 0.5
+    bf16 = cpu_tier_capacity_blocks(cache, gib, False)
+    fp8 = cpu_tier_capacity_blocks(cache, gib, True)
+    record = Fp8Layout.from_cache(cache).record_bytes
+    assert bf16 == int(gib * 2**30 / cache.block_bytes)
+    # A full tier stays inside its budget and leaves no room for another record.
+    assert fp8 * record <= gib * 2**30 < (fp8 + 1) * record
+    assert 1.5 * bf16 < fp8 <= 2 * bf16
+
+
+def test_metrics_show_a_failed_pin_and_the_tier_budget(micro_model):
+    backend = NativeBackend("cpu", staging_bytes=1 << 20, ids_capacity=256)
+    backend.engine.set_pin_limit(0)
+    served = Served(micro_model, ByteTokenizer(), "micro", agent=AgentConfig(policy=Policy.SWAP, cpu_capacity_blocks=1000), transfer=backend)
+    try:
+        reply = served.client.post("/v1/completions", json={"prompt": list(range(40)), "max_tokens": 2, "session_id": "s"})
+        assert reply.status_code == 200
+        metrics = served.client.get("/metrics").json()
+        assert metrics["pin_failure_drops"] == 1 and metrics["dropped"] == 1 and metrics["swapped"] == 0
+        assert metrics["cpu_tier_capacity_blocks"] == 1000 and metrics["cpu_tier_peak_blocks"] == 0
+        assert "host_pins" in metrics and "host_pin_ns" in metrics
+        # The engine survived: another turn still works.
+        again = served.client.post("/v1/completions", json={"prompt": [1, 2, 3], "max_tokens": 1, "session_id": "t"})
+        assert again.status_code == 200
+    finally:
+        served.close()
+        backend.close()
+
+
+def test_metrics_separate_blocks_only_the_radix_tree_holds(api):
+    api.client.post("/v1/completions", json={"prompt": list(range(40)), "max_tokens": 1})
+    metrics = api.client.get("/metrics").json()
+    # A one-off's KV is gone from its session, so its two whole blocks are the tree's alone.
+    assert metrics["radix_only_blocks"] == metrics["radix_blocks"] == 2
+
+
 def test_openai_sdk_can_talk_to_the_server(api):
     from openai import OpenAI
 
@@ -244,6 +284,71 @@ def test_engine_failure_during_a_stream_sends_an_error_event(micro_model):
         assert lines[-1] == "[DONE]" and "boom" in json.loads(lines[-2])["error"]["message"]
     finally:
         served.close()
+
+
+def run_main_until_scheduler(monkeypatch, tmp_path, argv):
+    """Run the server's real main up to the point it would listen, and return what it built."""
+    import layover.server as server
+
+    built = {}
+    monkeypatch.setattr("layover.weights.resolve_checkpoint", lambda name: name)
+    monkeypatch.setattr("layover.weights.load_model", lambda *a, **k: Qwen3(CFG).bfloat16().eval())
+    monkeypatch.setattr(server, "HFTokenizer", lambda root: ByteTokenizer())
+
+    class FakeLoop:
+        def __init__(self, scheduler):
+            built["scheduler"] = scheduler
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(server, "EngineLoop", FakeLoop)
+    monkeypatch.setattr(server, "create_app", lambda *a, **k: None)
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    costs = tmp_path / "costs.json"
+    costs.write_text(json.dumps({
+        "swap_out_s_coef": [0.0, 1e-6], "swap_in_s_coef": [0.0, 1e-6], "recompute_s_coef": [0.0, 1e-5, 0.0],
+        "fp8_swap_out_s_coef": [0.0, 5e-7], "fp8_swap_in_s_coef": [0.0, 5e-7],
+        "measured_on_gpu": False, "transfer": "plain",
+    }))
+    server.main(["--model", "x", "--cost-model", str(costs), "--pool-gib", "0.01", *argv])
+    return built["scheduler"]
+
+
+def test_server_defaults_use_the_torch_reference_and_plain_copies(monkeypatch, tmp_path):
+    from layover.kernels.decode_attention import paged_decode_attention_torch
+    from layover.kv.transfer import PlainCopyBackend
+
+    scheduler = run_main_until_scheduler(monkeypatch, tmp_path, [])
+    assert scheduler.model.decode_attention is paged_decode_attention_torch
+    assert isinstance(scheduler.tier.backend, PlainCopyBackend)
+    assert scheduler.tier.fp8 is False
+
+
+def test_triton_flag_selects_the_kernel(monkeypatch, tmp_path):
+    pytest.importorskip("triton")
+    from layover.kernels.triton_decode import paged_decode_attention_triton
+
+    scheduler = run_main_until_scheduler(monkeypatch, tmp_path, ["--decode-backend", "triton"])
+    assert scheduler.model.decode_attention is paged_decode_attention_triton
+
+
+def test_offload_dtype_flag_reaches_the_tier(monkeypatch, tmp_path):
+    scheduler = run_main_until_scheduler(monkeypatch, tmp_path, ["--offload-dtype", "fp8"])
+    assert scheduler.tier.fp8 is True
+
+
+def test_fp8_swap_times_come_from_the_fp8_measurement(monkeypatch, tmp_path):
+    scheduler = run_main_until_scheduler(monkeypatch, tmp_path, ["--offload-dtype", "fp8"])
+    assert scheduler.costs.swap_out_s(1000) == pytest.approx(5e-4)
+
+
+def test_a_cost_model_from_another_transfer_path_is_refused(monkeypatch, tmp_path):
+    with pytest.raises((ValueError, SystemExit)):
+        run_main_until_scheduler(monkeypatch, tmp_path, ["--transfer", "native"])
 
 
 def test_parse_tool_calls():

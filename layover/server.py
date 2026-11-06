@@ -35,6 +35,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from layover.agent.scheduler import AgentScheduler, AgentTurn, SessionBusy
 from layover.engine import RequestTooLarge
+from layover.kernels.fp8 import Fp8Layout
 
 log = logging.getLogger("layover")
 
@@ -153,6 +154,15 @@ class EngineLoop(threading.Thread):
             self._fail_all()
 
 
+def cpu_tier_capacity_blocks(cache, gib: float, fp8: bool) -> int:
+    """How many blocks a tier of this size holds, by what its records really occupy.
+
+    The budget is bytes, so FP8's smaller records fit about twice the tokens of BF16's.
+    """
+    record_bytes = Fp8Layout.from_cache(cache).record_bytes if fp8 else cache.block_bytes
+    return int(gib * 2**30 / record_bytes)
+
+
 def error_response(status: int, message: str, kind: str) -> JSONResponse:
     return JSONResponse({"error": {"message": message, "type": kind}}, status_code=status)
 
@@ -246,7 +256,11 @@ def create_app(loop: EngineLoop, tokenizer, model_name: str, default_max_tokens:
                 "blocks_total": scheduler.cache.allocator.num_blocks,
                 "blocks_free": scheduler.cache.allocator.num_free,
                 "radix_blocks": scheduler.tree.num_blocks,
+                # Evictable on demand, so a comparison of pool use leaves these out.
+                "radix_only_blocks": sum(scheduler.cache.allocator.refcount(b) == 1 for b in scheduler.tree.block_ids()),
                 "cpu_tier_blocks": scheduler.tier.used_blocks,
+                "cpu_tier_capacity_blocks": scheduler.tier.capacity_blocks,
+                "cpu_tier_peak_blocks": scheduler.tier.peak_used_blocks,
                 "cpu_tier_bytes_moved": scheduler.tier.bytes_moved,
                 "waiting": len(scheduler.waiting),
                 "running": len(scheduler.running),
@@ -395,6 +409,7 @@ def main(argv=None) -> None:
     from layover.agent.scheduler import AgentConfig
     from layover.engine import EngineConfig
     from layover.kv.paged_cache import PagedKVCache
+    from layover.kv.transfer import make_backend
     from layover.weights import load_model, resolve_checkpoint
 
     p = argparse.ArgumentParser(description="Serve a model over the OpenAI-compatible API")
@@ -408,6 +423,9 @@ def main(argv=None) -> None:
     p.add_argument("--ttl-cap-s", type=float, default=30.0)
     p.add_argument("--no-prefix-cache", action="store_true")
     p.add_argument("--cpu-tier-gib", type=float, default=32.0)
+    p.add_argument("--decode-backend", default="torch", choices=["torch", "triton"], help="triton needs a Linux install of it")
+    p.add_argument("--transfer", default="plain", choices=["plain", "native"], help="native needs make -C native cuda or host")
+    p.add_argument("--offload-dtype", default="bf16", choices=["bf16", "fp8"], help="fp8 needs triton")
     p.add_argument("--max-batch", type=int, default=32)
     p.add_argument("--prefill-chunk", type=int, default=512)
     p.add_argument("--host", default="127.0.0.1")
@@ -419,6 +437,10 @@ def main(argv=None) -> None:
     dtype = {"bf16": torch.bfloat16, "fp32": torch.float32}[args.dtype]
     root = str(resolve_checkpoint(args.model))
     model = load_model(root, device=args.device, dtype=dtype)
+    if args.decode_backend == "triton":
+        from layover.kernels.triton_decode import paged_decode_attention_triton
+
+        model.decode_attention = paged_decode_attention_triton
     token_bytes = model.cfg.kv_bytes_per_token(args.dtype)
     block_bytes = token_bytes * args.block_tokens
     cache = PagedKVCache(model.cfg, int(args.pool_gib * 2**30 / block_bytes), args.device, dtype, args.block_tokens)
@@ -426,11 +448,12 @@ def main(argv=None) -> None:
         policy=Policy(args.policy),
         ttl_cap_s=args.ttl_cap_s,
         prefix_cache=not args.no_prefix_cache,
-        cpu_capacity_blocks=int(args.cpu_tier_gib * 2**30 / block_bytes),
+        cpu_capacity_blocks=cpu_tier_capacity_blocks(cache, args.cpu_tier_gib, args.offload_dtype == "fp8"),
     )
-    costs = CostModel.from_json(args.cost_model, require_gpu=args.device == "cuda")
+    costs = CostModel.from_json(args.cost_model, require_gpu=args.device == "cuda", transfer=args.transfer)
     engine = EngineConfig(args.max_batch, args.prefill_chunk, args.prefill_chunk)
-    scheduler = AgentScheduler(model, cache, costs, engine, agent)
+    transfer = make_backend(args.transfer, args.device)
+    scheduler = AgentScheduler(model, cache, costs, engine, agent, transfer=transfer, offload_fp8=args.offload_dtype == "fp8")
     loop = EngineLoop(scheduler)
     loop.start()
     try:

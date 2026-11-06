@@ -9,7 +9,7 @@ description = "Agent-aware LLM inference engine with per-tool-call KV cache plac
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "torch>=2.5",
+    "torch>=2.15",
     "transformers>=4.51",
     "safetensors",
     "huggingface_hub",
@@ -22,7 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "hypothesis", "openai"]
-gpu = ["triton>=3.0"]
+gpu = ["triton==3.9.0", "nvidia-ml-py"]
 
 [tool.setuptools.packages.find]
 include = ["layover*"]

@@ -7,7 +7,9 @@ import numpy as np
 import pytest
 import torch
 
+from layover.agent.cost_model import CostModel
 from layover.config import ModelConfig
+from layover.kv.transfer import NativeBackend, PlainCopyBackend
 
 spec = importlib.util.spec_from_file_location(
     "kv_crossover", Path(__file__).resolve().parents[1] / "bench" / "kv_crossover.py"
@@ -134,11 +136,145 @@ def test_end_to_end_writes_labelled_outputs(tmp_path, backend):
     assert (tmp_path / "kv_crossover.png").stat().st_size > 0
 
 
+@pytest.mark.parametrize("transfer", ["plain", "native"])
+def test_cost_model_records_the_path_it_measured_and_loads_for_it(tmp_path, transfer):
+    meta = kv.main(["--tokens", "32", "64", "--repeats", "2", "--chunk", "32", "--transfer", transfer, "--out", str(tmp_path)])
+    assert meta["transfer"] == transfer and "fp8_swap_out_s_coef" not in meta
+    path = tmp_path / "cost_model.json"
+    assert CostModel.from_json(path, transfer=transfer).transfer == transfer
+    other = {"plain": "native", "native": "plain"}[transfer]
+    with pytest.raises(ValueError, match="measured through"):
+        CostModel.from_json(path, transfer=other)
+
+
+@pytest.mark.parametrize("transfer", ["plain", "native"])
+def test_fp8_offload_adds_its_own_times_next_to_bf16(tmp_path, transfer):
+    meta = kv.main(
+        ["--tokens", "32", "64", "128", "--repeats", "2", "--chunk", "32", "--transfer", transfer, "--offload-dtype", "fp8", "--out", str(tmp_path)]
+    )
+    assert meta["offload_dtype"] == "fp8"
+    model = CostModel.from_json(tmp_path / "cost_model.json")
+    assert model.for_offload(True).swap_out_s_coef == meta["fp8_swap_out_s_coef"]
+    assert model.for_offload(False).swap_out_s_coef == meta["swap_out_s_coef"]
+    with (tmp_path / "kv_crossover.csv").open() as f:
+        rows = list(csv.DictReader(f))
+    assert all(float(r["bf16_swap_out_s"]) > 0 and float(r["swap_out_s"]) > 0 for r in rows)
+
+
+def test_a_corrupting_transfer_stops_the_benchmark():
+    class Corrupting(PlainCopyBackend):
+        def start_out(self, cache, blocks, fp8=False):
+            ticket = super().start_out(cache, blocks, fp8)
+            ticket.payload.memory[0] ^= 1
+            return ticket
+
+    cfg, model = kv.load_layover_model("micro", torch.device("cpu"), torch.bfloat16, 0)
+    cache = kv.layover_prefill_cache(model, kv.make_ids(cfg, 32, torch.device("cpu"), 0), 32, torch.bfloat16)
+    with pytest.raises(RuntimeError, match="bytes changed"):
+        kv.measure_transfer(Corrupting(), cache, False, torch.device("cpu"), 0)
+
+
+def test_hf_backend_refuses_paths_it_cannot_measure(tmp_path):
+    with pytest.raises(SystemExit):
+        kv.main(["--backend", "hf", "--transfer", "native", "--out", str(tmp_path)])
+    with pytest.raises(SystemExit):
+        kv.main(["--dtype", "fp16", "--offload-dtype", "fp8", "--out", str(tmp_path)])
+
+
 def test_rejects_cuda_without_gpu(tmp_path):
     if torch.cuda.is_available():
         pytest.skip("a GPU is present")
     with pytest.raises(SystemExit):
         kv.main(["--device", "cuda", "--out", str(tmp_path)])
+
+
+def test_a_late_crash_keeps_what_was_measured_and_no_cost_model_comes_of_it(tmp_path, monkeypatch):
+    real, calls = kv.measure, []
+
+    def crash_on_second(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise MemoryError("the host ran out at the second length")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(kv, "measure", crash_on_second)
+    with pytest.raises(MemoryError):
+        kv.main(["--tokens", "32", "64", "--repeats", "1", "--chunk", "32", "--out", str(tmp_path)])
+    with (tmp_path / "kv_crossover.csv").open() as f:
+        assert [row["tokens"] for row in csv.DictReader(f)] == ["32"]
+    partial = json.loads((tmp_path / "cost_model.partial.json").read_text())
+    assert partial["complete"] is False
+    # What loads as a cost model must come from a whole sweep.
+    assert not (tmp_path / "cost_model.json").exists()
+
+
+def test_a_finished_sweep_leaves_only_the_complete_cost_model(tmp_path):
+    meta = kv.main(["--tokens", "32", "64", "--repeats", "1", "--chunk", "32", "--out", str(tmp_path)])
+    assert meta["complete"] is True
+    assert not (tmp_path / "cost_model.partial.json").exists()
+    assert json.loads((tmp_path / "cost_model.json").read_text())["complete"] is True
+
+
+def test_recompute_clock_does_not_include_allocating_the_cache(monkeypatch):
+    """A server's pool exists before it recomputes, so that cost is never paid while serving."""
+    cfg, model = kv.load_layover_model("micro", torch.device("cpu"), torch.bfloat16, 0)
+    args = kv.parse_args(["--repeats", "1", "--warmup", "0", "--chunk", "32"])
+    real_cache, real_timed = kv.new_cache, kv.timed
+    clock_running, allocated_on_clock = [False], []
+
+    def watched_cache(*a, **k):
+        allocated_on_clock.append(clock_running[0])
+        return real_cache(*a, **k)
+
+    def watched_timed(device, fn):
+        clock_running[0] = True
+        try:
+            return real_timed(device, fn)
+        finally:
+            clock_running[0] = False
+
+    monkeypatch.setattr(kv, "new_cache", watched_cache)
+    monkeypatch.setattr(kv, "timed", watched_timed)
+    kv.measure(model, cfg, 32, args, torch.device("cpu"), PlainCopyBackend())
+    assert allocated_on_clock == [False]
+
+
+def test_kept_repeats_reuse_a_pinned_buffer_at_every_length_of_a_sweep(monkeypatch):
+    """Earlier lengths' buffers must not crowd out the next, or its every repeat pins on the clock.
+
+    At these sizes the two buffers fit a 4 MiB cache only one at a time, as 16,384 and 32,768
+    tokens of BF16 do not both fit 8 GiB once the smaller classes have filled it.
+    """
+    cfg = ModelConfig.micro()
+    model = type("NoModel", (), {"cfg": cfg})()
+    monkeypatch.setattr(kv, "prefill_into", lambda *a: None)
+    args = kv.parse_args(["--repeats", "2", "--warmup", "1"])
+    backend = NativeBackend("cpu", staging_bytes=1 << 20, ids_capacity=4096, host_cache_bytes=4 << 20)
+    try:
+        rows = [kv.measure(model, cfg, n, args, torch.device("cpu"), backend) for n in (4096, 8192)]
+    finally:
+        backend.close()
+    assert [r.cold_pins for r in rows] == [0, 0]
+
+
+def test_a_pin_inside_a_kept_repeat_is_reported(tmp_path, capsys):
+    meta = kv.main(
+        ["--tokens", "32", "--repeats", "1", "--warmup", "0", "--chunk", "32", "--transfer", "native", "--out", str(tmp_path)]
+    )
+    assert meta["cold_pins_in_kept_repeats"] >= 1 and meta["host_pins"] >= 1 and meta["host_pin_s"] > 0
+    assert "host pins inside kept repeats" in capsys.readouterr().out
+
+
+def test_fp8_verification_widens_a_slice_at_a_time(monkeypatch):
+    from layover.kernels import fp8
+
+    cfg, model = kv.load_layover_model("micro", torch.device("cpu"), torch.bfloat16, 0)
+    cache = kv.layover_prefill_cache(model, kv.make_ids(cfg, 640, torch.device("cpu"), 0), 640, torch.bfloat16)
+    seen, real = [], fp8.round_trip_bound
+    monkeypatch.setattr(fp8, "round_trip_bound", lambda bits: (seen.append(bits.numel()), real(bits))[1])
+    kv.measure_transfer(PlainCopyBackend(), cache, True, torch.device("cpu"), 0)
+    assert sum(seen) == cache.pool.numel()
+    assert max(seen) * 2 <= cache.pool.numel()
 
 
 @pytest.mark.gpu
@@ -147,3 +283,12 @@ def test_gpu_swap_and_recompute_measured(tmp_path):
         ["--device", "cuda", "--tokens", "512", "1024", "--repeats", "2", "--out", str(tmp_path)]
     )
     assert meta["measured_on_gpu"] is True
+
+
+@pytest.mark.gpu
+def test_gpu_native_fp8_path_is_measured(tmp_path):
+    meta = kv.main(
+        ["--device", "cuda", "--tokens", "512", "1024", "--repeats", "2", "--transfer", "native", "--offload-dtype", "fp8", "--out", str(tmp_path)]
+    )
+    assert meta["measured_on_gpu"] is True and meta["transfer"] == "native"
+    assert CostModel.from_json(tmp_path / "cost_model.json", require_gpu=True, transfer="native").fp8_swap_out_s_coef

@@ -59,6 +59,30 @@ def test_prefill_logits_match_transformers(pair, chunk):
         assert (got - expected.float()).abs().max() <= tolerance(expected.float(), dtype)
 
 
+def test_prefill_attention_is_eligible_for_a_fused_kernel(monkeypatch):
+    """The math path builds the whole attention matrix, which a long context cannot afford.
+
+    The call passes unbatched tensors, which torch gives a batch dimension before it picks a
+    backend, on CUDA as on CPU. test_gpu.py checks the choice on the device itself.
+    """
+    calls = []
+    real = torch.nn.functional.scaled_dot_product_attention
+
+    def spy(q, k, v, attn_mask=None):
+        calls.append(torch._fused_sdp_choice(q, k, v, attn_mask=attn_mask))
+        return real(q, k, v, attn_mask=attn_mask)
+
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", spy)
+    torch.manual_seed(0)
+    model = Qwen3(CFG).to(dtype=torch.bfloat16).eval()
+    cache = PagedKVCache(CFG, 8, dtype=torch.bfloat16)
+    table = BlockTable()
+    model.prefill(cache, table, torch.arange(32), 0)
+    model.prefill(cache, table, torch.arange(32), 32)
+    math = int(torch.nn.attention.SDPBackend.MATH)
+    assert len(calls) == 2 * CFG.num_hidden_layers and math not in calls
+
+
 def test_decode_logits_match_transformers(pair):
     hf, model, dtype = pair
     prompt_set = prompts()

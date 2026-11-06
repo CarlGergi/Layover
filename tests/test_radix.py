@@ -1,7 +1,7 @@
-"""Radix tree against a dictionary model, and copy-on-write through real blocks."""
+"""Radix tree against a dictionary model and an LRU free queue, and copy-on-write through real blocks."""
 
 import torch
-from hypothesis import settings
+from hypothesis import given, settings
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, invariant, rule
 
@@ -167,3 +167,134 @@ def test_fork_from_tree_writes_copy_on_write():
     assert child.blocks[0] == parent.blocks[0] and child.blocks[1] != parent.blocks[1]
     assert cache.pool[parent.blocks[1]].equal(before[parent.blocks[1]])
     assert cache.read_range(child, 0, 3)[0].equal(data[:, :3])
+
+
+def test_evict_takes_a_path_from_its_tail():
+    allocator = BlockAllocator(4)
+    tree = RadixTree(allocator, 2)
+    blocks = allocator.alloc(3)
+    tree.insert([1, 1, 2, 2, 3, 3], blocks)
+    for block in blocks:
+        allocator.decref(block)
+    assert tree.evict(1) == 1
+    assert allocator.refcount(blocks[2]) == 0 and allocator.refcount(blocks[1]) == 1
+    assert tree.evict(1) == 1
+    assert allocator.refcount(blocks[1]) == 0 and allocator.refcount(blocks[0]) == 1
+
+
+def stored(allocator, tree, *paths):
+    """Insert each path on fresh blocks, leaving only the tree's references."""
+    out = []
+    for path in paths:
+        blocks = allocator.alloc(len(path) // 2)
+        tree.insert(path, blocks)
+        for block in blocks:
+            allocator.decref(block)
+        out.append(blocks)
+    return out
+
+
+def test_a_partial_hit_refreshes_only_the_blocks_it_covered():
+    allocator = BlockAllocator(8)
+    tree = RadixTree(allocator, 2)
+    long, other = stored(allocator, tree, [1, 1, 2, 2, 3, 3], [7, 7])
+    assert tree.match([1, 1, 9, 9]) == [long[0]]
+    # The two blocks past the hit are older than the other path, so they go before it.
+    assert tree.evict(2) == 2
+    assert allocator.refcount(long[2]) == allocator.refcount(long[1]) == 0
+    assert allocator.refcount(other[0]) == 1
+    assert tree.evict(1) == 1
+    assert allocator.refcount(other[0]) == 0 and allocator.refcount(long[0]) == 1
+
+
+def test_losing_a_sibling_does_not_make_the_other_look_recent():
+    allocator = BlockAllocator(8)
+    tree = RadixTree(allocator, 2)
+    first, second, newer = stored(allocator, tree, [1, 1, 2, 2], [1, 1, 3, 3], [9, 9])
+    # Only the shared block is now newer than [9, 9].
+    assert tree.match([1, 1]) == [first[0]]
+    assert tree.evict(1) == 1
+    assert allocator.refcount(first[1]) == 0
+    # Its edge now has no sibling, but [1, 1, 3, 3] is still older than [9, 9].
+    assert tree.evict(1) == 1
+    assert allocator.refcount(second[1]) == 0 and allocator.refcount(newer[0]) == 1
+
+
+class FreeQueueMachine(RuleBasedStateMachine):
+    """Eviction order against a block-level LRU free queue, the order vLLM keeps.
+
+    As in vllm/v1/core/block_pool.py: a hit takes blocks out of the queue while a turn holds
+    them, a finished turn puts them at the end tail first, and eviction takes from the front.
+    The queue is written from that description. The tree keeps one copy of a block a concurrent
+    turn computed too, so a finish counts for the whole path it reached.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.allocator = BlockAllocator(256)
+        self.tree = RadixTree(self.allocator, SIZE)
+        self.queue: list[int] = []
+        self.holders: dict[int, int] = {}
+        self.turns: list[tuple[list[int], list[int], list[int]]] = []
+
+    @rule(tokens=token_lists)
+    def start(self, tokens):
+        if len(tokens) // SIZE > self.allocator.num_free:
+            return
+        hit = self.tree.match(tokens)
+        for block in hit:
+            self.allocator.incref(block)
+            self.holders[block] = self.holders.get(block, 0) + 1
+            if block in self.queue:
+                self.queue.remove(block)
+        fresh = self.allocator.alloc(len(tokens) // SIZE - len(hit))
+        self.turns.append((tokens, hit, fresh))
+
+    @rule(pick=st.integers(0, 100))
+    def finish(self, pick):
+        if not self.turns:
+            return
+        tokens, hit, fresh = self.turns.pop(pick % len(self.turns))
+        self.tree.insert(tokens, hit + fresh)
+        for block in hit:
+            self.holders[block] -= 1
+        for block in hit + fresh:
+            self.allocator.decref(block)
+        for block in reversed(self.tree.match(tokens)):
+            if not self.holders.get(block):
+                if block in self.queue:
+                    self.queue.remove(block)
+                self.queue.append(block)
+
+    @rule(count=st.integers(1, 3))
+    def evict(self, count):
+        before = self.tree.block_ids()
+        expected, self.queue = self.queue[:count], self.queue[count:]
+        assert self.tree.evict(count) == len(expected)
+        assert before - self.tree.block_ids() == set(expected)
+
+    @invariant()
+    def queue_is_what_only_the_tree_holds(self):
+        held = {block for _, hit, _ in self.turns for block in hit}
+        assert self.tree.block_ids() == set(self.queue) | held
+        assert all(self.allocator.refcount(block) == 1 for block in self.queue)
+
+    @invariant()
+    def an_ancestor_is_never_older_than_its_descendants(self):
+        stack = [self.tree.root]
+        while stack:
+            node = stack.pop()
+            for child in node.children.values():
+                assert child.last_used <= node.last_used
+                stack.append(child)
+
+    def teardown(self):
+        for _, hit, fresh in self.turns:
+            for block in hit + fresh:
+                self.allocator.decref(block)
+        self.tree.clear()
+        assert self.allocator.num_used == 0
+
+
+TestFreeQueue = FreeQueueMachine.TestCase
+TestFreeQueue.settings = settings(max_examples=300, stateful_step_count=40, deadline=None)

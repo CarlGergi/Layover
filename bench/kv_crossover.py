@@ -2,11 +2,15 @@
 """Measure when swapping a KV cache beats recomputing it.
 
 For each context length this records:
-  * swap-out: copy every K and V tensor from the device to pinned CPU memory
-  * swap-in:  copy them back
+  * swap-out: copy the KV to CPU memory through --transfer, the path the tier really uses,
+    with blocks scattered as they are in a long-running pool
+  * swap-in:  copy them back through the same path
   * recompute: chunked prefill from token ids, which is what a dropped cache costs
     (through the engine by default; --backend hf times transformers instead, whose
     cache concatenates on every chunk and so overstates the cost)
+
+--offload-dtype fp8 also measures FP8 offload, quantizing included, next to BF16; the
+crossover then describes FP8 and the cost model gains its FP8 swap times.
 
 The output is a CSV, a plot, and cost_model.json, the fit that the agent cost
 model in layover.agent.cost_model loads. Only a run on a CUDA device gives numbers
@@ -33,6 +37,9 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from layover.config import ModelConfig  # noqa: E402
+from layover.kernels.fp8 import Fp8Layout, round_trip_within_bound  # noqa: E402
+from layover.kv import PagedKVCache  # noqa: E402
+from layover.kv.transfer import make_backend  # noqa: E402
 
 DEFAULT_TOKENS = [512, 1024, 2048, 4096, 8192, 16384, 32768]
 CPU_SMOKE_TOKENS = [64, 128, 256, 512, 1024]
@@ -53,6 +60,11 @@ class Row:
     recompute_min_s: float
     recompute_max_s: float
     cheaper: str
+    # With --offload-dtype fp8 the swap columns above are FP8's and these are BF16's.
+    bf16_swap_out_s: float | None = None
+    bf16_swap_in_s: float | None = None
+    # Host pins inside the kept repeats. Anything but 0 means their copy times include a pin.
+    cold_pins: int = 0
 
 
 def sync(device: torch.device) -> None:
@@ -113,17 +125,29 @@ def load_layover_model(name: str, device: torch.device, dtype: torch.dtype, seed
 
 
 def layover_prefill(model, ids: torch.Tensor, chunk: int, dtype: torch.dtype) -> list[torch.Tensor]:
-    """Chunked prefill through the engine, which is what a dropped cache really costs."""
-    from layover.kv import BlockTable, PagedKVCache
+    return [layover_prefill_cache(model, ids, chunk, dtype).pool]
 
+
+def new_cache(model, ids: torch.Tensor, dtype: torch.dtype) -> PagedKVCache:
     tokens = ids.shape[1]
     if tokens % 16:
         raise ValueError("the layover backend measures whole 16-token blocks")
-    cache = PagedKVCache(model.cfg, tokens // 16, ids.device, dtype)
+    return PagedKVCache(model.cfg, tokens // 16, ids.device, dtype)
+
+
+def prefill_into(model, cache: PagedKVCache, ids: torch.Tensor, chunk: int) -> None:
+    """Chunked prefill through the engine, which is what a dropped cache really costs."""
+    from layover.kv import BlockTable
+
     table = BlockTable()
-    for start in range(0, tokens, chunk):
+    for start in range(0, ids.shape[1], chunk):
         model.prefill(cache, table, ids[0, start : start + chunk], start)
-    return [cache.pool]
+
+
+def layover_prefill_cache(model, ids: torch.Tensor, chunk: int, dtype: torch.dtype) -> PagedKVCache:
+    cache = new_cache(model, ids, dtype)
+    prefill_into(model, cache, ids, chunk)
+    return cache
 
 
 def make_ids(cfg: ModelConfig, tokens: int, device: torch.device, seed: int) -> torch.Tensor:
@@ -160,20 +184,71 @@ def measure_swap(kv: list[torch.Tensor], device: torch.device) -> tuple[float, f
     return out_s, in_s
 
 
-def measure(model, cfg, tokens, args, device) -> Row:
+def scatter(blocks: int, seed: int) -> list[int]:
+    return torch.randperm(blocks, generator=torch.Generator().manual_seed(seed)).tolist()
+
+
+def measure_transfer(backend, cache, fp8: bool, device: torch.device, seed: int) -> tuple[float, float]:
+    """Round-trip every block of a cache once through a transfer backend, and verify.
+
+    Restoring into a permutation of the same blocks keeps the pool's allocation untouched by
+    the measurement, and copying in an order unrelated to the pool's is what a pool that has
+    been through evictions looks like.
+    """
+    blocks = cache.allocator.num_blocks
+    source, target = scatter(blocks, seed), scatter(blocks, seed + 1)
+    before = cache.pool[torch.tensor(source, device=device)].to("cpu", copy=True)
+    tickets = []
+
+    def out():
+        tickets.append(backend.start_out(cache, source, fp8))
+        tickets[-1].wait()
+
+    def into():
+        backend.start_in(cache, target, tickets[0].payload).wait()
+
+    out_s = timed(device, out)
+    in_s = timed(device, into)
+    after = cache.pool[torch.tensor(target, device=device)].to("cpu")
+    if fp8:
+        layout = Fp8Layout.from_cache(cache)
+        if not round_trip_within_bound(before, after, layout.group_elems, ignore_nonfinite=True):
+            raise RuntimeError("KV values left the FP8 error bound across the swap round trip")
+    elif checksum([before]) != checksum([after]):
+        raise RuntimeError("KV bytes changed across the swap round trip")
+    backend.free(tickets[0].payload)
+    return out_s, in_s
+
+
+def pins_so_far(transfer) -> int:
+    return transfer.pin_stats().get("host_pins", 0) if transfer is not None else 0
+
+
+def measure(model, cfg, tokens, args, device, transfer=None) -> Row:
     ids = make_ids(cfg, tokens, device, args.seed)
-    out_samples, in_samples, recompute_samples = [], [], []
+    fp8 = args.offload_dtype == "fp8"
+    out_samples, in_samples, recompute_samples, bf16_out, bf16_in = [], [], [], [], []
+    pins_at_start = 0
     for i in range(args.warmup + args.repeats):
-        holder: list[list[torch.Tensor]] = []
+        if i == args.warmup:
+            pins_at_start = pins_so_far(transfer)
+        holder: list = []
         if args.backend == "layover":
-            prefill = lambda: holder.append(layover_prefill(model, ids, args.chunk, DTYPES[args.dtype]))  # noqa: E731
+            # Allocated outside the clock: a server's pool already exists when it recomputes.
+            holder.append(new_cache(model, ids, DTYPES[args.dtype]))
+            prefill = lambda: prefill_into(model, holder[0], ids, args.chunk)  # noqa: E731
         else:
             prefill = lambda: holder.append(hf_prefill(model, ids, args.chunk))  # noqa: E731
         recompute_s = timed(device, prefill)
-        kv = holder[0]
+        kv = [holder[0].pool] if args.backend == "layover" else holder[0]
         if sum(t.numel() for t in kv) * kv[0].element_size() != tokens * cfg.kv_bytes_per_token(args.dtype):
             raise RuntimeError("measured KV size disagrees with the config-derived size")
-        out_s, in_s = measure_swap(kv, device)
+        if args.backend == "layover":
+            # BF16 first, because FP8's round trip changes the values.
+            base_out, base_in = measure_transfer(transfer, holder[0], False, device, args.seed + i)
+            out_s, in_s = measure_transfer(transfer, holder[0], True, device, args.seed + i) if fp8 else (base_out, base_in)
+        else:
+            base_out, base_in = out_s, in_s = measure_swap(kv, device)
         del kv, holder
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -181,6 +256,8 @@ def measure(model, cfg, tokens, args, device) -> Row:
             out_samples.append(out_s)
             in_samples.append(in_s)
             recompute_samples.append(recompute_s)
+            bf16_out.append(base_out)
+            bf16_in.append(base_in)
     swap_samples = [a + b for a, b in zip(out_samples, in_samples)]
     swap = statistics.median(swap_samples)
     recompute = statistics.median(recompute_samples)
@@ -196,6 +273,9 @@ def measure(model, cfg, tokens, args, device) -> Row:
         recompute_min_s=min(recompute_samples),
         recompute_max_s=max(recompute_samples),
         cheaper="swap" if swap < recompute else "recompute",
+        bf16_swap_out_s=statistics.median(bf16_out),
+        bf16_swap_in_s=statistics.median(bf16_in),
+        cold_pins=pins_so_far(transfer) - pins_at_start,
     )
 
 
@@ -286,7 +366,10 @@ def write_plot(rows: list[Row], meta: dict, path: Path) -> None:
     ax.spines[["top", "right"]].set_visible(False)
     ax.margins(x=0.14)
     ax.legend(frameon=False, fontsize=8, loc="upper left")
-    title = f"KV swap vs recompute: {meta['model']}, {meta['dtype']}, {meta['device_name']}"
+    title = (
+        f"KV swap vs recompute: {meta['model']}, {meta['dtype']}, {meta['offload_dtype']} offload,"
+        f" {meta['transfer']} copies, {meta['device_name']}"
+    )
     if not meta["measured_on_gpu"]:
         title += "\nNOT a GPU measurement: pipeline check only"
     ax.set_title(title, fontsize=9, loc="left")
@@ -307,8 +390,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--device", default="cpu", choices=["cpu", "mps", "cuda"])
     p.add_argument("--dtype", default="bf16", choices=["bf16", "fp16"])
     p.add_argument("--backend", default="layover", choices=["layover", "hf"], help="whose prefill to time")
+    p.add_argument("--transfer", default="plain", choices=["plain", "native"], help="the tier's copy path to measure")
+    p.add_argument("--offload-dtype", default="bf16", choices=["bf16", "fp8"], help="also measure offload in this format")
+    p.add_argument("--staging-mib", type=int, default=128, help="size of each staging buffer of --transfer native")
+    p.add_argument("--host-cache-mib", type=int, default=8192, help="pinned memory --transfer native keeps for reuse")
     p.add_argument("--tokens", type=int, nargs="+", help="context lengths to measure")
-    p.add_argument("--chunk", type=int, default=1024, help="prefill chunk size")
+    p.add_argument("--chunk", type=int, default=2048, help="prefill chunk size; the serving engine's, to price what it pays")
     p.add_argument("--repeats", type=int, default=5)
     p.add_argument("--warmup", type=int, default=1, help="leading repeats to discard")
     p.add_argument("--seed", type=int, default=0)
@@ -323,6 +410,14 @@ def main(argv=None) -> dict:
         raise SystemExit("--device cuda requested but no CUDA GPU is available")
     tokens = args.tokens or (DEFAULT_TOKENS if device.type == "cuda" else CPU_SMOKE_TOKENS)
     dtype = DTYPES[args.dtype]
+    if args.backend == "hf" and (args.transfer != "plain" or args.offload_dtype != "bf16"):
+        raise SystemExit("--backend hf has no KV pool, so it can only time plain BF16 copies")
+    if args.offload_dtype == "fp8" and args.dtype != "bf16":
+        raise SystemExit("FP8 offload needs a BF16 pool")
+
+    # Before the model loads: a library that was never built should fail in seconds.
+    options = {"staging_bytes": args.staging_mib << 20, "host_cache_bytes": args.host_cache_mib << 20} if args.transfer == "native" else {}
+    transfer = make_backend(args.transfer, device, **options)
 
     loader = load_layover_model if args.backend == "layover" else load_hf_model
     cfg, model = loader(args.model, device, dtype, args.seed)
@@ -330,37 +425,72 @@ def main(argv=None) -> dict:
     if too_long:
         raise SystemExit(f"{too_long} exceed max_position_embeddings={cfg.max_position_embeddings}")
 
+    if args.backend == "layover":
+        # First-use work is not what a copy costs. The cache is only a shape: one idle block.
+        idle = PagedKVCache(cfg, 1, device, dtype)
+        transfer.prepare(idle, False)
+        if args.offload_dtype == "fp8":
+            transfer.prepare(idle, True)
+        del idle
+
     rows = []
+
+    def describe(complete: bool) -> dict:
+        x = np.array([r.tokens for r in rows])
+        fp8_coefficients = {}
+        if args.offload_dtype == "fp8":
+            fp8_coefficients = {
+                "fp8_swap_out_s_coef": fit_nonnegative(x, np.array([r.swap_out_s for r in rows]), 1),
+                "fp8_swap_in_s_coef": fit_nonnegative(x, np.array([r.swap_in_s for r in rows]), 1),
+            }
+        pins = transfer.pin_stats()
+        return {
+            "model": args.model,
+            "dtype": args.dtype,
+            "backend": args.backend,
+            "transfer": args.transfer,
+            "offload_dtype": args.offload_dtype,
+            "device": args.device,
+            "device_name": device_name(device),
+            "measured_on_gpu": device.type == "cuda",
+            "complete": complete,
+            "kv_bytes_per_token": cfg.kv_bytes_per_token(args.dtype),
+            "chunk": args.chunk,
+            "repeats": args.repeats,
+            "warmup": args.warmup,
+            "cold_pins_in_kept_repeats": sum(r.cold_pins for r in rows),
+            "host_pins": pins.get("host_pins", 0),
+            "host_pin_gib": pins.get("host_pin_bytes", 0) / 2**30,
+            "host_pin_s": pins.get("host_pin_ns", 0) / 1e9,
+            "host_pin_max_s": pins.get("host_pin_max_ns", 0) / 1e9,
+            "swap_out_s_coef": fit_nonnegative(x, np.array([r.bf16_swap_out_s for r in rows]), 1),
+            "swap_in_s_coef": fit_nonnegative(x, np.array([r.bf16_swap_in_s for r in rows]), 1),
+            **fp8_coefficients,
+            "recompute_s_coef": fit_nonnegative(x, np.array([r.recompute_s for r in rows]), 2),
+            **find_crossover(rows),
+        }
+
+    # A late crash keeps what was measured. The fit so far goes under a name of its own, because
+    # one from a truncated sweep must never be loaded as the cost model.
+    partial = args.out / "cost_model.partial.json"
+    args.out.mkdir(parents=True, exist_ok=True)
     for n in tokens:
-        rows.append(measure(model, cfg, n, args, device))
+        rows.append(measure(model, cfg, n, args, device, transfer))
         r = rows[-1]
         print(
             f"{r.tokens:>6} tokens  {r.kv_bytes / 2**30:7.3f} GiB  swap {r.swap_s:9.4f}s"
             f"  recompute {r.recompute_s:9.4f}s  cheaper: {r.cheaper}",
             flush=True,
         )
+        if r.cold_pins:
+            print(f"WARNING: {r.tokens} tokens: {r.cold_pins} host pins inside kept repeats; raise --host-cache-mib", flush=True)
+        write_csv(rows, args.out / "kv_crossover.csv")
+        partial.write_text(json.dumps(describe(False), indent=2) + "\n")
 
-    x = np.array([r.tokens for r in rows])
-    meta = {
-        "model": args.model,
-        "dtype": args.dtype,
-        "backend": args.backend,
-        "device": args.device,
-        "device_name": device_name(device),
-        "measured_on_gpu": device.type == "cuda",
-        "kv_bytes_per_token": cfg.kv_bytes_per_token(args.dtype),
-        "chunk": args.chunk,
-        "repeats": args.repeats,
-        "warmup": args.warmup,
-        "swap_out_s_coef": fit_nonnegative(x, np.array([r.swap_out_s for r in rows]), 1),
-        "swap_in_s_coef": fit_nonnegative(x, np.array([r.swap_in_s for r in rows]), 1),
-        "recompute_s_coef": fit_nonnegative(x, np.array([r.recompute_s for r in rows]), 2),
-        **find_crossover(rows),
-    }
-
-    args.out.mkdir(parents=True, exist_ok=True)
-    write_csv(rows, args.out / "kv_crossover.csv")
+    meta = describe(True)
+    transfer.close()
     (args.out / "cost_model.json").write_text(json.dumps(meta, indent=2) + "\n")
+    partial.unlink()
     write_plot(rows, meta, args.out / "kv_crossover.png")
     print(f"KV bytes per token ({args.dtype}): {meta['kv_bytes_per_token']:,}")
     print(f"Outcome: {meta['outcome']}, crossover: {meta['crossover_tokens']}")

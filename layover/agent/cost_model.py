@@ -9,7 +9,7 @@ the loss from a wrong prediction, and expiry demotes to CPU instead of discardin
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 
@@ -23,7 +23,11 @@ class Placement(Enum):
 
 
 class Policy(Enum):
-    """Combined is the contribution; the single policies exist for ablation."""
+    """Combined is the contribution; the single policies exist for ablation.
+
+    Discard drops a paused session's KV. What the radix tree keeps of it is the scheduler's
+    business: see the AgentScheduler module docstring.
+    """
 
     COMBINED = "combined"
     KEEP_TTL = "keep_ttl"
@@ -41,14 +45,42 @@ class CostModel:
     swap_in_s_coef: list[float]
     recompute_s_coef: list[float]
     measured_on_gpu: bool = False
+    # Swap times with FP8 offload, quantizing included, when they were measured.
+    fp8_swap_out_s_coef: list[float] | None = None
+    fp8_swap_in_s_coef: list[float] | None = None
+    # The path the swap times were measured through.
+    transfer: str = "plain"
 
     @classmethod
-    def from_json(cls, path: str | Path, require_gpu: bool = False) -> "CostModel":
+    def from_json(cls, path: str | Path, require_gpu: bool = False, transfer: str | None = None) -> "CostModel":
+        """Load bench/kv_crossover.py's output.
+
+        Given `transfer`, refuses a file measured through a different path: prices from one
+        path would quietly drive placement on another.
+        """
         raw = json.loads(Path(path).read_text())
-        model = cls(raw["swap_out_s_coef"], raw["swap_in_s_coef"], raw["recompute_s_coef"], raw["measured_on_gpu"])
+        model = cls(
+            raw["swap_out_s_coef"],
+            raw["swap_in_s_coef"],
+            raw["recompute_s_coef"],
+            raw["measured_on_gpu"],
+            raw.get("fp8_swap_out_s_coef"),
+            raw.get("fp8_swap_in_s_coef"),
+            raw.get("transfer", "plain"),
+        )
         if require_gpu and not model.measured_on_gpu:
             raise ValueError(f"{path} was not measured on a GPU")
+        if transfer is not None and model.transfer != transfer:
+            raise ValueError(f"{path} was measured through {model.transfer!r} transfers, not {transfer!r}")
         return model
+
+    def for_offload(self, fp8: bool) -> "CostModel":
+        """The model whose swap times describe a tier storing BF16 or FP8."""
+        if not fp8:
+            return self
+        if self.fp8_swap_out_s_coef is None or self.fp8_swap_in_s_coef is None:
+            raise ValueError("this cost model has no FP8 swap times: measure them with kv_crossover --offload-dtype fp8")
+        return replace(self, swap_out_s_coef=self.fp8_swap_out_s_coef, swap_in_s_coef=self.fp8_swap_in_s_coef)
 
     def swap_out_s(self, tokens: int) -> float:
         return _poly(self.swap_out_s_coef, tokens)

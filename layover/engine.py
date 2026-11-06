@@ -40,8 +40,9 @@ class Request:
     last_logits: torch.Tensor | None = None
     on_token: Callable[["Request", int], None] | None = None
     on_finish: Callable[["Request"], None] | None = None
-    # Earliest time the request may run, for example while its KV is being copied in.
-    not_before: float = 0.0
+    # A copy of this request's KV in flight: a Ticket from layover.kv.transfer. The request
+    # does not run until it is done.
+    transfer: object | None = None
     submitted_at: float = 0.0
     admitted_at: float | None = None
     first_token_at: float | None = None
@@ -143,13 +144,19 @@ class Engine:
         if request.on_token is not None:
             request.on_token(request, token)
 
+    def _runnable(self, request: Request) -> bool:
+        if request.transfer is not None:
+            if not request.transfer.done():
+                return False
+            request.transfer = None
+        return True
+
     def _prefill(self) -> bool:
         budget = self.config.prefill_budget
         device = self.cache.device
         worked = False
-        now = self.clock()
         for request in self.running:
-            if request.state is not State.PREFILL or request.not_before > now:
+            if request.state is not State.PREFILL or not self._runnable(request):
                 continue
             while budget > 0 and request.prefilled < len(request.prompt):
                 count = min(self.config.prefill_chunk, budget, len(request.prompt) - request.prefilled)
@@ -198,13 +205,18 @@ class Engine:
     def _finish(self, request: Request) -> None:
         self.cache.release(request.table)
 
+    def _poll_transfers(self) -> bool:
+        """Notice finished copies. Never blocks. Returns whether any finished."""
+        return False
+
     def step(self) -> bool:
         """Advance every runnable request once. Returns whether anything happened."""
+        transferred = self._poll_transfers()
         self._admit()
         prefilled = self._prefill()
         decoded = self._decode()
         retired = self._retire()
-        return prefilled or decoded or retired
+        return transferred or prefilled or decoded or retired
 
     def run_until_idle(self, max_steps: int = 1_000_000) -> list[Request]:
         for _ in range(max_steps):

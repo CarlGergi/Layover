@@ -5,10 +5,16 @@ blocks that are safe to share: a KV entry depends only on the tokens up to it. T
 tree owns one reference on every block it stores. SGLang's RadixAttention (Zheng et
 al., NeurIPS 2024) is the reference design; here the tree also backs copy-on-write
 forks through PagedKVCache, so a shared block is cloned rather than overwritten.
+
+Recency follows a block-level LRU free queue, such as vLLM's FreeKVCacheBlockQueue: only the
+blocks a lookup or insert really covers are refreshed, so one edge never mixes recencies.
+An edge is split where recency changes and is not merged back, and an ancestor is never less
+recent than its descendants, so evicting tails of the least recent leaf is that queue's order.
 """
 
 from __future__ import annotations
 
+import heapq
 from collections.abc import Sequence
 
 from layover.kv.allocator import BlockAllocator
@@ -49,7 +55,7 @@ class RadixTree:
         return count
 
     def match(self, tokens: Sequence[int]) -> list[int]:
-        """Blocks of the longest stored prefix of `tokens`, whole blocks only."""
+        """Blocks of the longest stored prefix of `tokens`, whole blocks only, now most recent."""
         self._tick += 1
         node, offset, blocks = self.root, 0, []
         while True:
@@ -58,10 +64,10 @@ class RadixTree:
             if child is None:
                 return blocks
             shared = self._shared_blocks(child.tokens, tokens, offset)
-            blocks.extend(child.blocks[:shared])
+            # The rest of the edge was not reused, so it must keep its age.
             if shared < len(child.blocks):
-                child.last_used = self._tick
-                return blocks
+                child = self._split(child, shared)
+            blocks.extend(child.blocks)
             node, offset = child, offset + shared * self.block_tokens
 
     def _split(self, node: _Node, at_blocks: int) -> _Node:
@@ -117,46 +123,30 @@ class RadixTree:
                 leaves.append(node)
         return leaves
 
-    def _remove_if_empty(self, node: _Node) -> None:
-        if node.blocks or node.children or node.parent is None:
-            return
-        parent = node.parent
-        del parent.children[node.key]
-        if parent.parent is not None and len(parent.children) == 1:
-            self._merge_with_only_child(parent)
-
-    def _merge_with_only_child(self, node: _Node) -> None:
-        child = next(iter(node.children.values()))
-        node.tokens += child.tokens
-        node.blocks += child.blocks
-        node.children = child.children
-        for grandchild in node.children.values():
-            grandchild.parent = node
-        node.last_used = max(node.last_used, child.last_used)
-
     def evict(self, count: int) -> int:
-        """Free up to `count` blocks, least recently used leaves first.
+        """Free up to `count` blocks: the least recently used leaf first, tail block first.
 
         Blocks another table still references are left alone, since dropping the tree's
-        reference would free nothing while losing the entry. Returns the blocks freed.
+        reference would free nothing while losing the entry. Nothing else changes a refcount
+        during a call, so a leaf found held stays held. Returns the blocks freed.
         """
+        if count <= 0:
+            return 0
+        # The node's id breaks ties, since nodes do not compare.
+        heap = [(leaf.last_used, id(leaf), leaf) for leaf in self._leaves()]
+        heapq.heapify(heap)
         freed = 0
-        while freed < count:
-            candidates = sorted(self._leaves(), key=lambda n: n.last_used)
-            progress = False
-            for leaf in candidates:
-                while leaf.blocks and freed < count and self.allocator.refcount(leaf.blocks[-1]) == 1:
-                    self.allocator.decref(leaf.blocks.pop())
-                    leaf.tokens = leaf.tokens[: len(leaf.blocks) * self.block_tokens]
-                    freed += 1
-                    progress = True
-                if not leaf.blocks:
-                    self._remove_if_empty(leaf)
-                    break
-                if freed >= count:
-                    break
-            if not progress:
-                break
+        while heap and freed < count:
+            _, _, leaf = heapq.heappop(heap)
+            while leaf.blocks and freed < count and self.allocator.refcount(leaf.blocks[-1]) == 1:
+                self.allocator.decref(leaf.blocks.pop())
+                freed += 1
+            leaf.tokens = leaf.tokens[: len(leaf.blocks) * self.block_tokens]
+            if not leaf.blocks:
+                parent = leaf.parent
+                del parent.children[leaf.key]
+                if parent is not self.root and not parent.children:
+                    heapq.heappush(heap, (parent.last_used, id(parent), parent))
         return freed
 
     def clear(self) -> None:
@@ -168,6 +158,16 @@ class RadixTree:
             for block in node.blocks:
                 self.allocator.decref(block)
         self.root.children = {}
+
+    def block_ids(self) -> set[int]:
+        """Every block the tree holds a reference on."""
+        held: set[int] = set()
+        stack = [self.root]
+        while stack:
+            node = stack.pop()
+            held.update(node.blocks)
+            stack.extend(node.children.values())
+        return held
 
     @property
     def num_blocks(self) -> int:

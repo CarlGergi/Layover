@@ -1,3 +1,11 @@
+import os
+import sys
+
+# The interpreter runs Triton kernels as Python on CPU tensors. It must be set before
+# triton is imported, and never for a GPU run.
+if "--gpu" not in sys.argv:
+    os.environ.setdefault("TRITON_INTERPRET", "1")
+
 import pytest
 
 

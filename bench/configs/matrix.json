@@ -1,0 +1,147 @@
+{
+  "matched": {
+    "model": "Qwen/Qwen3-4B",
+    "device": "cuda",
+    "dtype": "bf16",
+    "max_context_tokens": 40960,
+    "kv_gib": 12.0,
+    "cpu_offload_gib": 32.0,
+    "max_running": 32,
+    "prefill_chunk": 2048,
+    "seed": 0
+  },
+  "tolerances": {
+    "kv_capacity_frac": 0.02,
+    "cpu_tier_frac": 0.01,
+    "gpu_memory_gib": 3.0,
+    "gpu_idle_gib": 1.0
+  },
+  "limits": {
+    "startup_timeout_s": 900,
+    "stop_timeout_s": 30,
+    "gpu_release_timeout_s": 60,
+    "request_timeout_s": 1800,
+    "run_timeout_s": 7200,
+    "max_consecutive_failures": 3
+  },
+  "reference_system": "layover-combined",
+  "layover": {
+    "cost_model": "results/kv_crossover/cost_model.json",
+    "ttl_cap_s": 30.0,
+    "decode_backend": "triton",
+    "transfer": "native",
+    "offload_dtype": "fp8"
+  },
+  "systems": [
+    {"name": "layover-combined", "kind": "layover", "policy": "combined"},
+    {"name": "vllm", "kind": "vllm", "venv": ".venvs/vllm"},
+    {"name": "sglang", "kind": "sglang", "venv": ".venvs/sglang"},
+    {"name": "layover-combined-bf16", "kind": "layover", "policy": "combined", "offload_dtype": "bf16"},
+    {"name": "layover-keep_ttl", "kind": "layover", "policy": "keep_ttl"},
+    {"name": "layover-swap", "kind": "layover", "policy": "swap"},
+    {"name": "layover-discard", "kind": "layover", "policy": "discard"},
+    {"name": "layover-discard-nocache", "kind": "layover", "policy": "discard", "prefix_cache": false, "label": "lower bound"}
+  ],
+  "default_plan": "first-pass",
+  "plans": {
+    "first-pass": {
+      "description": "Headline systems at three loads x 5 runs, then each ablation at 100% load x 3 runs. Ordered so a budget stop keeps the most valuable cells.",
+      "budget_hours": 20,
+      "other_stages_hours": 3.5,
+      "groups": [
+        {"role": "headline", "systems": ["layover-combined", "vllm", "sglang"], "loads": [1.0], "runs": 5},
+        {"role": "headline", "systems": ["layover-combined", "vllm", "sglang"], "loads": [1.25, 0.5], "runs": 5},
+        {"role": "headline", "systems": ["layover-discard", "layover-discard-nocache", "layover-combined-bf16", "layover-keep_ttl", "layover-swap"], "loads": [1.0], "runs": 3}
+      ]
+    },
+    "under-20h": {
+      "description": "Headline systems at 100% load x 5 and 125% x 3, no 50%, then each ablation at 100% load x 3.",
+      "budget_hours": 20,
+      "other_stages_hours": 3.5,
+      "groups": [
+        {"role": "headline", "systems": ["layover-combined", "vllm", "sglang"], "loads": [1.0, 1.25], "runs": {"load100": 5, "load125": 3}},
+        {"role": "headline", "systems": ["layover-discard", "layover-discard-nocache", "layover-combined-bf16", "layover-keep_ttl", "layover-swap"], "loads": [1.0], "runs": 3}
+      ]
+    },
+    "three-loads-lean": {
+      "description": "Headline systems at all three loads x 3, 100% first, then each ablation at 100% load x 2.",
+      "budget_hours": 20,
+      "other_stages_hours": 3.5,
+      "groups": [
+        {"role": "headline", "systems": ["layover-combined", "vllm", "sglang"], "loads": [1.0], "runs": 3},
+        {"role": "headline", "systems": ["layover-combined", "vllm", "sglang"], "loads": [1.25, 0.5], "runs": 3},
+        {"role": "headline", "systems": ["layover-discard", "layover-discard-nocache", "layover-combined-bf16", "layover-keep_ttl", "layover-swap"], "loads": [1.0], "runs": 2}
+      ]
+    },
+    "full": {
+      "description": "first-pass, then the synthetic sweeps over tool latency and branching, kept for later.",
+      "extends": "first-pass",
+      "groups": [
+        {"role": "sweep", "loads": [1.0], "runs": 5}
+      ]
+    }
+  },
+  "preflight_output_tokens": 64,
+  "runs": 5,
+  "seed_base": 1000,
+  "warmup_jobs": 5,
+  "time_scale": 1.0,
+  "system_tokens": 256,
+  "sampler_period_s": 0.25,
+  "kv_usage_poll_s": 2.0,
+  "workloads": [
+    {
+      "name": "headline-swebench",
+      "role": "headline",
+      "trace": "traces/swebench_30.jsonl",
+      "estimate_jobs": 30,
+      "calibration_group": "recorded"
+    }
+  ],
+  "sweeps": {
+    "systems": ["layover-combined", "vllm", "sglang"],
+    "calibration_group": "synthetic",
+    "warmup_jobs": 5,
+    "selection": {
+      "min_gap": 1.15,
+      "swap_s_per_token": 7.4e-6,
+      "expected_rates_per_s": [0.4, 0.8],
+      "method": "Chosen with bench/run_matrix.py --sweep-separation: the real scheduler on a virtual clock at estimate_assumptions and swap_s_per_token (about 20 GB/s), over one seed per run. These are simulated, assumed rates, never results. A point stays if, at each rung vLLM is expected to choose, Layover's combined policy beats discard with its radix tree on (a stand-in for a prefix cache with no working CPU tier) by min_gap in every run, with early demotions in the median run. 12 jobs barely filled the pool, so 40 jobs replaced them. Tool 8 s was dropped: at 40 jobs its gap was about 1.02 at these rungs, since long tool waits spread the load out, and 4 s fell short too at about 1.08 to 1.14. Combined and swap stay within about 3% of each other at every point, so these lines show keeping KV against losing it, not the combined policy against swap. expected_rates_per_s come from simulating the ladder on the reference point: 0.4 with offload inert (discard stand-in), 0.8 with offload working (swap stand-in).",
+      "simulated": {
+        "sweep-tool0.1-branch0": {"0.4": {"gap": [1.25, 1.92], "early_demotions": [31, 120]}, "0.8": {"gap": [2.06, 2.13], "early_demotions": [45, 77]}},
+        "sweep-tool0.5-branch0": {"0.4": {"gap": [1.48, 1.87], "early_demotions": [53, 68]}, "0.8": {"gap": [1.88, 2.00], "early_demotions": [16, 33]}},
+        "sweep-tool0.5-branch1": {"0.4": {"gap": [1.45, 1.57], "early_demotions": [15, 29]}, "0.8": {"gap": [1.61, 1.67], "early_demotions": [4, 20]}},
+        "sweep-tool0.5-branch2": {"0.4": {"gap": [1.45, 1.55], "early_demotions": [16, 34]}, "0.8": {"gap": [1.64, 1.83], "early_demotions": [5, 9]}},
+        "sweep-tool0.5-branch4": {"0.4": {"gap": [1.71, 1.81], "early_demotions": [1, 4]}, "0.8": {"gap": [1.67, 1.81], "early_demotions": [0, 4]}},
+        "sweep-tool2-branch0": {"0.4": {"gap": [1.15, 1.38], "early_demotions": [84, 119]}, "0.8": {"gap": [1.41, 1.50], "early_demotions": [91, 108]}}
+      }
+    },
+    "base": {
+      "shape": "swebench",
+      "jobs": 40,
+      "seed": 7,
+      "tool_median_s": 0.5,
+      "calibration_file": "results/calibration/calibration.json",
+      "overrides": {"tokens_basis": "cumulative"}
+    },
+    "tool_median_s": [0.1, 0.5, 2.0],
+    "branching": [0, 1, 2, 4]
+  },
+  "calibration": {
+    "system": "vllm",
+    "definition": "the arrival rate at which vLLM's mean JCT reaches target_slowdown times its unloaded mean JCT, on the full headline workload with warm-up jobs excluded. Unloaded is unloaded_jobs measured jobs, each run alone; a rung's mean is those same jobs in that rung, so the ratio is not one of two job mixes. The rate is log-interpolated between the two ladder rungs that bracket the crossing. A ladder that never crosses, or starts past it, stops the matrix unless --accept-saturation-edge is passed, and then every output says so.",
+    "unloaded_jobs": 8,
+    "rates_per_s": [0.02, 0.025, 0.03, 0.04, 0.05, 0.1, 0.4],
+    "rates_by_group": {"synthetic": [0.1, 0.2, 0.4, 0.8, 1.6]},
+    "start_rate_by_group": {"recorded": 0.03},
+    "target_slowdown": 1.5,
+    "expected_saturation_per_s": {"recorded": [0.025, 0.035]},
+    "expected_saturation_method": "SIMULATED, never a result: the real scheduler on a virtual clock over the 30 prepared trajectories with their recorded tool times, at estimate_assumptions. 0.025 jobs/s with vLLM's offload inert (discard with the prefix cache on as its stand-in) and 0.034 with it working (swap as its stand-in). The knee is sharp, so the rungs are close around it and the walk starts between them; for planning hours only."
+  },
+  "estimate_assumptions": {
+    "startup_s": 90,
+    "prefill_tokens_per_s": 15000,
+    "decode_tokens_per_s_per_stream": 60,
+    "decode_tokens_per_s_total": 800
+  }
+}

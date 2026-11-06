@@ -1,0 +1,79 @@
+{
+  "matched": {
+    "model": "Qwen/Qwen3-0.6B",
+    "device": "cpu",
+    "dtype": "bf16",
+    "max_context_tokens": 1024,
+    "kv_gib": 0.25,
+    "cpu_offload_gib": 0.25,
+    "max_running": 4,
+    "prefill_chunk": 64,
+    "seed": 0
+  },
+  "tolerances": {
+    "kv_capacity_frac": 0.02,
+    "gpu_memory_gib": 3.0,
+    "gpu_idle_gib": 1.0
+  },
+  "limits": {
+    "startup_timeout_s": 180,
+    "stop_timeout_s": 15,
+    "gpu_release_timeout_s": 60,
+    "request_timeout_s": 300,
+    "run_timeout_s": 600
+  },
+  "reference_system": "layover-combined",
+  "layover": {
+    "cost_model": "results/smoke_kv_crossover/cost_model.json",
+    "ttl_cap_s": 30.0
+  },
+  "systems": [
+    {"name": "layover-combined", "kind": "layover", "policy": "combined"},
+    {"name": "stub-token-ids", "kind": "command", "command": ["{python}", "tests/test_matrix.py", "--stub-port", "{port}", "--stub-model", "{model}"]},
+    {"name": "stub-text-only", "kind": "command", "command": ["{python}", "tests/test_matrix.py", "--stub-port", "{port}", "--stub-model", "{model}", "--stub-text-only"]}
+  ],
+  "plans": {
+    "first-pass": {
+      "description": "The shape of the real plan: headline-like systems first at 100%, then another load, then a one-run extra.",
+      "budget_hours": 1,
+      "groups": [
+        {"role": "sweep", "systems": ["layover-combined", "stub-token-ids"], "loads": [1.0], "runs": 2},
+        {"role": "sweep", "systems": ["layover-combined", "stub-token-ids"], "loads": [0.5], "runs": 1},
+        {"role": "sweep", "systems": ["stub-text-only"], "loads": [1.0], "runs": 1}
+      ]
+    }
+  },
+  "runs": 2,
+  "seed_base": 1000,
+  "warmup_jobs": 1,
+  "time_scale": 0.1,
+  "system_tokens": 16,
+  "kv_usage_poll_s": 0.5,
+  "workloads": [],
+  "sweeps": {
+    "calibration_group": "pipeline",
+    "warmup_jobs": 1,
+    "base": {
+      "shape": "swebench",
+      "jobs": 3,
+      "seed": 7,
+      "tool_median_s": 0.1,
+      "overrides": {"turns_mean": 2, "turns_sd": 0, "tokens_per_job_mean": 40, "tokens_per_job_sd": 0, "output_tokens_mean": 2, "branch_turns": 1}
+    },
+    "tool_median_s": [0.1],
+    "branching": [1]
+  },
+  "calibration": {
+    "system": "layover-combined",
+    "definition": "the rate where this stand-in's mean JCT reaches target_slowdown times unloaded. It describes the test pipeline and nothing else.",
+    "unloaded_jobs": 2,
+    "rates_per_s": [0.5, 2.0],
+    "target_slowdown": 1.5
+  },
+  "estimate_assumptions": {
+    "startup_s": 10,
+    "prefill_tokens_per_s": 200,
+    "decode_tokens_per_s_per_stream": 5,
+    "decode_tokens_per_s_total": 10
+  }
+}

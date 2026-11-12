@@ -101,6 +101,13 @@ printf '%s|%s|%s\\n' "${LAYOVER_NO_DOCKER-unset}" "${XDG_CACHE_HOME-unset}" "${H
 mkdir -p .venv/bin
 cat > .venv/bin/python <<'PY'
 #!/bin/bash
+case " $* " in
+    *" --print-baseline-kinds "*)
+        echo "$*" >> "$HOME/kinds_args.log"
+        if [ -f "$HOME/baseline-kinds" ]; then cat "$HOME/baseline-kinds"; else printf 'vllm\\nsglang\\n'; fi
+        exit 0
+        ;;
+esac
 echo "$*" >> "$HOME/preflight.log"
 [ ! -f "$HOME/fail-preflight" ]
 PY
@@ -168,7 +175,7 @@ def build_repo(repo):
         pytest.skip("needs git: the runner records the commit it syncs")
     write_executable(repo / "scripts" / "remote_gpu.sh", REAL_RUNNER.read_text())
     write_executable(repo / "scripts" / "setup_gpu.sh", SETUP_STUB)
-    write_executable(repo / "scripts" / "setup_baselines.sh", "#!/bin/bash\nexec bash stage_stub.sh baselines\n")
+    write_executable(repo / "scripts" / "setup_baselines.sh", '#!/bin/bash\necho "$*" >> "$HOME/baselines_args.log"\nexec bash stage_stub.sh baselines\n')
     write_executable(repo / "stage_stub.sh", STAGE_STUB)
     (repo / "Makefile").write_text(MAKEFILE_STUB)
     (repo / "README.md").write_text("readme\n")
@@ -801,6 +808,24 @@ def test_the_baselines_stage_also_runs_their_preflight(world):
     assert (world.home / "preflight.log").read_text().split() == [
         "bench/run_matrix.py", "--preflight-only", "--preflight-kinds", "vllm", "sglang", "--out", "results/matrix_preflight",
     ]
+
+
+def test_the_baselines_stage_installs_only_what_the_plan_runs(world):
+    world.control("baseline-kinds", "vllm\n")
+    assert world.run("--plan", "final").returncode == 0
+    assert (world.home / "baselines_args.log").read_text().split() == ["vllm"]
+    assert (world.home / "preflight.log").read_text().split() == [
+        "bench/run_matrix.py", "--preflight-only", "--preflight-kinds", "vllm", "--out", "results/matrix_preflight",
+    ]
+    assert "--plan final" in (world.home / "kinds_args.log").read_text()
+
+
+def test_a_plan_with_no_baseline_installs_none(world):
+    world.control("baseline-kinds", "")
+    result = world.run()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (world.home / "baselines_args.log").exists() and not (world.home / "preflight.log").exists()
+    assert "no baselines in this plan" in (world.state / "logs" / "baselines.log").read_text()
 
 
 def test_a_baseline_that_will_not_start_fails_its_own_stage(world):

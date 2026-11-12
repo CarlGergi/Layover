@@ -100,8 +100,9 @@ stage_command() {
         smoke) echo "make gpu-smoke" ;;
         gpu-tests) echo "make test-gpu" ;;
         sanitize) echo "make sanitize" ;;
-        # Launches each baseline once, so a broken one fails here and not hours into the matrix.
-        baselines) echo "bash scripts/setup_baselines.sh && .venv/bin/python bench/run_matrix.py --preflight-only --preflight-kinds vllm sglang --out results/matrix_preflight" ;;
+        # Installs and launches once each baseline the plan runs, so a broken one fails here and
+        # not hours into the matrix. A plan with no baseline installs nothing.
+        baselines) echo 'kinds=$(.venv/bin/python bench/run_matrix.py --print-baseline-kinds $MATRIX_ARGS | tr "\n" " ") && if [ -n "${kinds// /}" ]; then bash scripts/setup_baselines.sh $kinds && .venv/bin/python bench/run_matrix.py --preflight-only --preflight-kinds $kinds --out results/matrix_preflight; else echo "no baselines in this plan"; fi' ;;
         traces) echo "make traces" ;;
         reproduce) echo "make reproduce" ;;
     esac

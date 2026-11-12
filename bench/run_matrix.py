@@ -1782,6 +1782,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--drop-over-context", action="store_true", help="leave out jobs over the context limit, and say so")
     p.add_argument("--skip-preflight", action="store_true")
     p.add_argument("--preflight-only", action="store_true", help="launch each kind of system once, then stop")
+    p.add_argument("--print-baseline-kinds", action="store_true", help="print the baseline kinds the plan runs, vllm or sglang, one per line, and stop")
     p.add_argument("--preflight-kinds", nargs="+", help="with --preflight-only: only these kinds, for example vllm sglang, which need no Layover cost model")
     p.add_argument("--accept-mixed-hardware", action="store_true", help="resume on a different GPU or driver; the report flags every table it touches")
     p.add_argument("--no-report", action="store_true")
@@ -1802,6 +1803,12 @@ def main(argv=None) -> int:
     if plan_name:
         plan_groups(config, plan_name)
     config = effective_config(config, plan_name)
+    if args.print_baseline_kinds:
+        # What the baselines stage installs: a plan without SGLang does not pay for its install.
+        names = {system for group in plan_groups(config, plan_name) for system in group.get("systems", [])} if plan_name else None
+        kinds = {spec["kind"] for spec in config["systems"] if names is None or spec["name"] in names}
+        print("\n".join(kind for kind in ("vllm", "sglang") if kind in kinds))
+        return 0
     settings = MatchedSettings.from_config(config["matched"])
     rates_source = apply_measured_rates(config, args.measured_rates) if args.measured_rates else None
     if not args.pipeline_check and settings.device != "cuda":

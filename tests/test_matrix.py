@@ -3272,3 +3272,9 @@ def test_layover_systems_decode_through_cuda_graphs_in_the_published_config():
             assert system.command("127.0.0.1", 9)[-1] == "--cuda-graphs" or "--cuda-graphs" in system.command("127.0.0.1", 9)
     off = build_system({**run_matrix.system_specs(config)[0], "cuda_graphs": False}, SETTINGS, TOKEN_BYTES)
     assert "--cuda-graphs" not in off.command("127.0.0.1", 9)
+
+
+@pytest.mark.parametrize("plan, kinds", [("final", "vllm"), ("final-ablations", "vllm"), ("first-pass", "vllm\nsglang"), ("runpod-l4", "vllm\nsglang")])
+def test_the_baselines_a_plan_runs_are_printed_for_the_install(capsys, plan, kinds):
+    assert run_matrix.main(["--config", str(REPO / "bench/configs/matrix.json"), "--print-baseline-kinds", "--plan", plan, "--max-hours", "3"]) == 0
+    assert capsys.readouterr().out.strip() == kinds

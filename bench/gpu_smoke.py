@@ -47,7 +47,7 @@ from bench.systems import BLOCK_TOKENS, _descendants, _kill_quietly  # noqa: E40
 
 DEFAULT_CONFIG = REPO / "bench" / "configs" / "matrix.json"
 PIPELINE_LABEL = "PIPELINE CHECK on CPU: micro model, host build. Measures nothing about a GPU."
-DEFAULT_PLAN = "first-pass"
+DEFAULT_PLAN = "under-20h"
 
 # A normal run is about 10 minutes (an assumption until the first GPU session). This limit is on
 # the broken case: a check that starts past it is recorded as blocked.
@@ -107,7 +107,10 @@ class Context:
         return Path(self.tmp) / "crossover" / "cost_model.json"
 
     def matrix(self) -> dict:
-        return json.loads(Path(self.config).read_text())
+        """The matrix config at the settings of the plan being priced, which may change them."""
+        from bench.run_matrix import effective_config
+
+        return effective_config(json.loads(Path(self.config).read_text()), self.plan)
 
 
 def bf16():

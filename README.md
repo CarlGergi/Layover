@@ -56,33 +56,50 @@ To serve a model on CPU, produce a cost model and start the server:
 .venv/bin/python -m layover.server --model Qwen/Qwen3-0.6B --cost-model results/cpu/cost_model.json
 ```
 
-To run everything on a rented x86 Linux VM with a 24 GB class NVIDIA GPU and at least 64 GiB of RAM,
-from this checkout:
+To run everything on a rented x86 Linux VM with a 24 GB class NVIDIA GPU, at least 64 GiB of RAM,
+and passwordless sudo, from this checkout:
 
 ```bash
 make traces-prepare
 ```
 
 ```bash
-scripts/remote_gpu.sh user@host -i key --plan under-20h --stop-after-smoke
+scripts/remote_gpu.sh user@host -i key --plan under-20h --stop-after-smoke --detach
 ```
 
-That syncs the tree over SSH and runs setup, then a short GPU smoke stage, so a broken setup costs
-minutes. With `--stop-after-smoke` it stops there and prints the plan's hours priced from measured
-rates. Run the same command without that flag, and with `--max-hours`, to continue through the
-baselines, GPU tests, compute-sanitizer, trace re-execution, and `make reproduce`. `results/` and
-`traces/` come back during and after the run. It survives dropped connections and resumes, needs a
-working Docker daemon (rentals that are themselves containers usually cannot run it), refuses an
-instance with an IAM role unless `--allow-iam-role`, and never terminates the instance.
+That syncs the tree over SSH, starts the run on the machine, and returns: nothing on this side
+needs to stay awake. The machine runs setup and then a short GPU smoke stage, so a broken setup
+costs minutes, and with `--stop-after-smoke` stops there, having priced the plan from measured
+rates. `--status` checks in; `--fetch-only` copies `results/` and `traces/` here. The same command
+without `--stop-after-smoke`, and with `--max-hours`, continues through the baselines, GPU tests,
+compute-sanitizer, trace re-execution, and `make reproduce`.
 
-On spot instances add `--spot-notice --reconnect-timeout 600`. Each finished run is written
-atomically and fetched within about a minute while this machine stays online and awake. On a
-replacement, `--restore-from results/gpu-<timestamp>` pushes what came back and skips what is
-finished; the budget carries over, and another GPU type or driver is refused.
+The machine never bills idle. When its run ends, finished, over budget, or after 3 failed matrix
+cells in a row, it shuts itself down a minute later, and a timer set at the start shuts it down
+regardless after a limit (`--max-session-hours`). On AWS, keep the instance's shutdown behavior at
+Stop, its default, so its disk keeps the results; start it again and run `--fetch-only`, which
+shuts it down once the copy is back. `--no-auto-shutdown` turns this off.
+
+Only the trace re-execution stage needs a working Docker daemon, which rentals that are themselves
+containers usually cannot run; a run without that stage skips the check. It refuses an instance with an IAM role unless `--allow-iam-role`. Each finished run is written
+atomically and kept, so a re-run resumes; on a replacement machine, `--restore-from
+results/gpu-<timestamp>` pushes what came back, and another GPU type or driver is refused.
+
+On a RunPod pod, add `--runpod`. A pod is a container where `shutdown` does nothing, so the pod
+stops itself with `runpodctl stop pod` and the API key RunPod gives each pod. The run directory,
+environments and model weights live on the `/workspace` volume, which a stop keeps; the CUDA toolkit
+lives on the container disk, so a restarted pod runs setup again. Preflight reads the container's
+memory limit rather than the host's RAM, and installs rsync if it is missing. The SSH port changes
+on every restart. Delete the pod once the results are back: a stopped pod still bills for its disk.
+
+```bash
+scripts/remote_gpu.sh root@IP -p PORT -i key --runpod --plan runpod-l4 --stages "setup smoke"
+```
 
 `make reproduce` regenerates every number for the chosen plan and refuses to run without a CUDA GPU
 and the re-executed trace. A re-run keeps complete measurements (`FORCE=1` re-measures), because a
-new cost model would invalidate saved runs.
+new cost model would invalidate saved runs. Tool pauses during a benchmark are the durations stored
+in the trace by re-execution, so every system waits exactly as long and no command runs then.
 
 ## Benchmark plans
 
@@ -91,15 +108,17 @@ saturation rate, measured once and applied as the same absolute rates to every s
 
 | Plan | Headline: `layover-combined`, `vllm`, `sglang` | Ablations at 100% load |
 | --- | --- | --- |
-| `first-pass` (default) | 50%, 100%, 125% load, 5 runs each | 3 runs each |
-| `under-20h` | 100% load 5 runs, 125% load 3 runs | 3 runs each |
+| `under-20h` (default) | 100% load 5 runs, 125% load 3 runs; then one 50% run each for `layover-combined` and `vllm` if time remains | 3 runs each |
+| `first-pass` | 50%, 100%, 125% load, 5 runs each | 3 runs each |
 | `three-loads-lean` | all three loads, 3 runs each | 2 runs each |
 | `full` | as `first-pass`, plus synthetic sweeps | 3 runs each |
+| `runpod-l4` | `layover-combined` and `vllm` at 100% and 125% load, 3 runs each, then `sglang` the same; CPU tier 24 GiB | 2 runs each |
 
 The ablations are `layover-discard`, `layover-discard-nocache` (a strict lower bound: no prefix cache
 at all), `layover-combined-bf16` (isolates the FP8 gain), `layover-keep_ttl`, and `layover-swap`. Each
 ratio to `layover-combined` compares the same seeds. `layover-discard` leaves freed blocks reusable
-until memory pressure, as vLLM does. Every offloading system gets 32 GiB of CPU memory. Settings,
+until memory pressure, as vLLM does. Every offloading system gets 32 GiB of CPU memory, except
+under a plan that sets its own (`runpod-l4` gives 24 GiB, to fit a 50 GB container). Settings,
 flags, and remaining differences between systems are in `bench/configs/baseline_flags.md`.
 
 ## API
@@ -150,6 +169,15 @@ result carries its trace's `source`, and the headline refuses anything that does
 The source submission and the machine type travel with every trace. Prompts replayed from a trace
 are random token ids matching the real lengths and shared prefix, since a trace holds counts, not
 text. Raw trajectories stay in the gitignored `traces/` folder.
+
+**Selection effect in the recorded trace.** Re-execution replaced 9 of the 30 first-chosen tasks
+with reserves, mostly because the replayed commands no longer produced the recorded final patch.
+The replaced tasks were the slow ones: the recorded tool time of the selected set fell from 2,299 s
+to 1,516 s, and re-executed on the trace machine (an `m7i-flex.large`) the final 30 tasks spend
+480 s in tools across 1,272 turns. Shorter tool calls mean shorter pauses, which likely favors
+keeping KV in GPU memory over swapping or dropping it, and these results say little about agents
+whose tool calls run for minutes. Together with the 32,768-token context cap,
+which excluded 20% of the tasks walked, the workload is lighter than the submission it comes from.
 
 **Synthetic.** `python -m layover.replay generate` makes sweeps over tool latency and branching
 factor, with a shape following the statistics in the Continuum paper. `make calibration` fits it to

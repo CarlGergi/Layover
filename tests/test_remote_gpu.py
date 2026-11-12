@@ -97,6 +97,7 @@ esac
 
 # Setup leaves an environment, and the baselines stage's preflight runs through its python.
 SETUP_STUB = """#!/bin/bash
+printf '%s|%s|%s\\n' "${LAYOVER_NO_DOCKER-unset}" "${XDG_CACHE_HOME-unset}" "${HF_HOME-unset}" >> "$HOME/setup_env.log"
 mkdir -p .venv/bin
 cat > .venv/bin/python <<'PY'
 #!/bin/bash
@@ -109,9 +110,15 @@ exec bash stage_stub.sh setup
 
 # Only sudo-docker-ok lets sudo work, so that the real sudo is never tried from a test.
 SUDO_STUB = """#!/bin/bash
-[ -f "$HOME/sudo-docker-ok" ] || exit 1
 [ "$1" = -n ] && shift
+# shutdown resolves to the logging stub below, never the real one.
+case "$1" in shutdown|true) [ -f "$HOME/no-sudo" ] && exit 1; exec "$@" ;; esac
+[ -f "$HOME/sudo-docker-ok" ] || exit 1
 ROOT_NOW=1 exec "$@"
+"""
+
+SHUTDOWN_STUB = """#!/bin/bash
+echo "$*" >> "$HOME/shutdown.log"
 """
 
 # What a machine's libc says about its RAM. A page is 4 KiB, so a GiB is 262144 pages.
@@ -120,6 +127,20 @@ case "$1" in
     PAGESIZE) echo 4096 ;;
     _PHYS_PAGES) echo $(( $(cat "$HOME/ram-gib" 2>/dev/null || echo 64) * 262144 )) ;;
 esac
+"""
+
+# RunPod's CLI, as in a pod: it works with the pod's own key. runpodctl-v1 makes it the older one,
+# whose commands put the verb first.
+RUNPODCTL_STUB = """#!/bin/bash
+echo "$*" >> "$HOME/runpodctl.log"
+[ ! -f "$HOME/runpodctl-broken" ] && [ -n "${RUNPOD_API_KEY:-}" ] || exit 1
+if [ -f "$HOME/runpodctl-v1" ]; then
+    case "$1 $2" in "get pod"|"stop pod") exit 0 ;; esac
+else
+    case "$1 $2" in "pod get"|"pod stop") exit 0 ;; esac
+fi
+echo "unknown command" >&2
+exit 1
 """
 
 # The metadata service, or with no imds file a machine off AWS, where nothing answers.
@@ -202,8 +223,11 @@ class World:
         write_executable(self.remote_bin / "docker", DOCKER_STUB)
         write_executable(self.remote_bin / "uname", UNAME_STUB)
         write_executable(self.remote_bin / "sudo", SUDO_STUB)
+        write_executable(self.remote_bin / "shutdown", SHUTDOWN_STUB)
         write_executable(self.remote_bin / "getconf", GETCONF_STUB)
         write_executable(self.remote_bin / "curl", CURL_STUB)
+        write_executable(self.remote_bin / "runpodctl", RUNPODCTL_STUB)
+        self.extra_env = {}
         self.write_shims()
 
     def write_shims(self):
@@ -221,7 +245,8 @@ while [ $# -gt 0 ]; do
     esac
 done
 cd {shlex.quote(str(self.home))} || exit 1
-HOME={shlex.quote(str(self.home))} PATH={shlex.quote(str(self.remote_bin))}:/usr/bin:/bin:/usr/sbin:/sbin exec bash -c "$*"
+remote_path={shlex.quote(str(self.remote_bin))}:/usr/bin:/bin:/usr/sbin:/sbin
+HOME={shlex.quote(str(self.home))} PATH="${{TEST_REMOTE_PATH:-$remote_path}}" exec bash -c "$*"
 """,
         )
         write_executable(
@@ -249,7 +274,7 @@ exec {shlex.quote(real_rsync)} "${{args[@]}}"
 
     @property
     def env(self):
-        return dict(os.environ, PATH=f"{self.shims}:{os.environ['PATH']}")
+        return dict(os.environ, PATH=f"{self.shims}:{os.environ['PATH']}", **self.extra_env)
 
     @property
     def run_dir(self):
@@ -307,12 +332,13 @@ exec {shlex.quote(real_rsync)} "${{args[@]}}"
     def clean_up(self):
         for hold in self.home.glob("hold-*"):
             hold.unlink()
-        pid_file = self.state / "runner.pid"
-        if pid_file.exists():
-            try:
-                os.kill(int(pid_file.read_text()), signal.SIGKILL)
-            except (ProcessLookupError, ValueError):
-                pass
+        for name in ("runner.pid", "stop_timer.pid"):
+            pid_file = self.state / name
+            if pid_file.exists():
+                try:
+                    os.kill(int(pid_file.read_text()), signal.SIGKILL)
+                except (ProcessLookupError, ValueError):
+                    pass
 
 
 @pytest.fixture
@@ -338,7 +364,10 @@ def test_local_part_avoids_what_macos_lacks():
 
 
 def test_local_part_never_deletes_or_stops_anything():
-    words = local_part().split()
+    # The preflight script is sent to the machine and runs there, so it is not this side.
+    local = local_part()
+    start = local.index("preflight_script() {")
+    words = (local[:start] + local[local.index("\nREMOTE\n}", start):]).split()
     for banned in ("rm", "rmdir", "shutdown", "poweroff", "halt", "reboot", "terminate-instances"):
         assert banned not in words, banned
 
@@ -417,7 +446,7 @@ def test_full_run_in_order_with_results_and_traces_back(world):
     assert [row["name"] for row in world.times()["stages"]] == ["preflight", "sync", *ORDER, "fetch"]
     assert all(row["status"] == "done" and row["seconds"] is not None for row in rows.values())
     assert world.times()["gpu"].startswith("NVIDIA L4")
-    assert "still billing" in result.stdout
+    assert "shuts itself down" in result.stdout
     assert (world.repo / "results" / "old_local_result.txt").read_text() == "keep me"
     assert "Cost:" not in result.stdout and world.times()["cost_usd"] is None
     # Everything but the one sync towards the machine only adds. openrsync re-runs itself through
@@ -501,7 +530,7 @@ def test_failed_stage_stops_later_ones_fetches_and_sets_the_exit_code(world, sta
     row = world.stage_rows()[stage]
     assert row["status"] == "failed" and row["exit_code"] == stage_rc
     assert f"FAILED: {stage}" in result.stdout
-    assert "still billing" in result.stdout
+    assert "shuts itself down" in result.stdout
 
 
 def test_resume_runs_from_the_failed_stage(world):
@@ -842,7 +871,7 @@ def test_stop_after_smoke_stops_there_and_the_same_command_goes_on(world):
     assert result.returncode == 0, result.stdout + result.stderr
     assert world.calls == ["setup", "smoke"]
     assert "12.5 to 19 hours" in result.stdout
-    assert "without --stop-after-smoke" in result.stdout and "still billing" in result.stdout
+    assert "without --stop-after-smoke" in result.stdout and "shuts itself down" in result.stdout
     assert (world.session_dir() / "results" / "smoke" / "refined_hours.txt").exists()
     # It is the same session, going on from where it stopped.
     session = world.session_dir()
@@ -1356,7 +1385,7 @@ def test_attaching_does_not_change_a_runs_settings(world):
         process.kill()
     assert "apply only when a run starts" in output
     assert stage_env(world, "reproduce")["MATRIX_ARGS"] == "--plan p1"
-    assert (world.state / "settings").read_text().split() == ["plan", "p1"]
+    assert (world.state / "settings").read_text().split() == ["plan", "p1", "auto_shutdown", "1", "deadman_hours", "48"]
 
 
 # ---- the budget ---------------------------------------------------------------------------------
@@ -1368,7 +1397,7 @@ def test_over_budget_stops_after_smoke_and_says_so(world):
     assert result.returncode == 20, result.stdout + result.stderr
     assert world.calls == ["setup", "smoke"]
     assert "OVER BUDGET" in result.stdout and "at least 12.5 hours" in result.stdout and "--max-hours is 10" in result.stdout
-    assert "--continue-over-budget" in result.stdout and "still billing" in result.stdout
+    assert "--continue-over-budget" in result.stdout and "shuts itself down" in result.stdout
     assert "Not finished" not in result.stdout
     assert world.stage_rows()["baselines"]["status"] == "pending"
 
@@ -2052,6 +2081,8 @@ class SetupWorld:
         self.toolkit = base / "toolkit"
         self.os_release = base / "os-release"
         self.os_release.write_text('ID=ubuntu\nVERSION_ID="24.04"\nPRETTY_NAME="Ubuntu 24.04"\n')
+        self.apt = base / "apt"
+        (self.apt / "sources.list.d").mkdir(parents=True)
         write_executable(self.repo / "scripts" / "setup_gpu.sh", REAL_SETUP.read_text())
         (self.repo / "native").mkdir()
         (self.repo / "native" / "Makefile").write_text("cuda:\n\t@echo built\n")
@@ -2085,6 +2116,7 @@ class SetupWorld:
             TOOLKIT_DIR=str(self.toolkit),
             OS_RELEASE=str(self.os_release),
             XDG_CACHE_HOME=str(self.cache),
+            APT_DIR=str(self.apt),
             **env,
         )
         return subprocess.run(
@@ -2276,6 +2308,35 @@ def test_setup_adds_the_user_to_the_docker_group_when_only_root_can_use_it(setup
     assert "usermod -aG docker gpu" in setup_world.logged
 
 
+def test_setup_leaves_docker_alone_for_a_run_without_traces(setup_world):
+    # A rented container: Docker cannot run, and need not.
+    result = setup_world.run(DOCKER_BROKEN="1", LAYOVER_NO_DOCKER="1")
+    assert result.returncode == 0, result.stderr
+    assert "Docker: left alone" in result.stdout
+    assert "docker run" not in setup_world.logged and "usermod" not in setup_world.logged
+    assert "cuda-toolkit-13-2" in setup_world.logged
+
+
+def test_setup_uses_nvidias_repository_where_the_image_already_has_it(setup_world):
+    (setup_world.apt / "sources.list.d" / "cuda.list").write_text(
+        "deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/ /\n"
+    )
+    result = setup_world.run()
+    assert result.returncode == 0, result.stderr
+    assert "already configured" in result.stdout
+    assert "cuda-keyring" not in setup_world.logged and "dpkg -i" not in setup_world.logged
+    assert "install -y --no-install-recommends cuda-toolkit-13-2" in setup_world.logged
+
+
+def test_setup_unpacks_uv_without_setting_owners(setup_world):
+    # Root on a pod's network volume may not chown, and tar as root tries to.
+    shutil.rmtree(setup_world.cache / "layover")
+    write_executable(setup_world.stubs / "tar", '#!/bin/bash\necho "tar $*" >> "$SETUP_LOG"\nwhile [ $# -gt 0 ]; do [ "$1" = -C ] && dir=$2; shift; done\nprintf "#!/bin/bash\\necho \\"uv \\$*\\" >> \\"$SETUP_LOG\\"\\n" > "$dir/uv"; chmod +x "$dir/uv"\n')
+    result = setup_world.run()
+    assert result.returncode == 0, result.stderr
+    assert "tar --no-same-owner -xzf" in setup_world.logged
+
+
 def test_setup_needs_no_key_or_model_account():
     script = REAL_SETUP.read_text()
     for banned in ("HF_TOKEN", "huggingface-cli login", "API_KEY", "ssh-keygen"):
@@ -2378,7 +2439,8 @@ class RealRun:
             BASH, str(self.repo / "scripts" / "remote_gpu.sh"), "gpu@127.0.0.1",
             "-p", self.container.port, "-i", str(self.container.key),
             "--ssh-option", f"UserKnownHostsFile={self.container.known_hosts}",
-            "--remote-dir", self.run_dir, "--poll", "1", "--min-disk-gb", "0", "--min-ram-gb", "0", "--allow-iam-role", *args,
+            "--remote-dir", self.run_dir, "--poll", "1", "--min-disk-gb", "0", "--min-ram-gb", "0", "--allow-iam-role",
+            "--no-auto-shutdown", *args,
         ]
 
     def run(self, *args, timeout=180):
@@ -2591,3 +2653,276 @@ def test_e2e_a_container_without_docker_is_refused_by_name(container, tmp_path):
     assert result.returncode == 10, result.stdout + result.stderr
     assert "itself a container" in result.stdout
     assert run.calls() == []
+
+
+# ---- the machine never bills idle --------------------------------------------------------------
+
+
+def shutdowns(world):
+    path = world.home / "shutdown.log"
+    return path.read_text().splitlines() if path.exists() else []
+
+
+def test_the_machine_shuts_down_a_minute_after_the_run_ends(world):
+    result = world.run()
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = shutdowns(world)
+    # The dead-man first, then the end; each replaces the one pending.
+    assert calls[0].startswith("-h +2880 ") and calls[-1].startswith("-h +1 ")
+    assert "shuts itself down when its run ends" in result.stdout + result.stderr
+
+
+def test_a_failed_stage_also_shuts_the_machine_down(world):
+    world.control("fail-gpu-tests")
+    result = world.run()
+    assert result.returncode == 13
+    assert shutdowns(world)[-1].startswith("-h +1 ")
+
+
+def test_the_dead_man_limit_follows_the_plan(world):
+    world.run("--stop-after-smoke")
+    assert shutdowns(world)[0].startswith("-h +120 ")
+    (world.home / "shutdown.log").unlink()
+    world.run("--max-hours", "16.5")
+    assert shutdowns(world)[0].startswith("-h +1350 ")
+    (world.home / "shutdown.log").unlink()
+    world.run("--max-session-hours", "0.5", "--from", "setup")
+    assert shutdowns(world)[0].startswith("-h +30 ")
+
+
+def test_no_auto_shutdown_leaves_the_machine_alone(world):
+    result = world.run("--no-auto-shutdown")
+    assert result.returncode == 0
+    assert shutdowns(world) == []
+    assert "still billing (--no-auto-shutdown)" in result.stdout + result.stderr
+
+
+def test_without_passwordless_sudo_preflight_refuses_before_anything_runs(world):
+    world.control("no-sudo")
+    result = world.run()
+    assert result.returncode == 10
+    assert "auto-shutdown needs shutdown and passwordless sudo" in result.stdout + result.stderr
+    assert world.calls == []
+    assert "no run started on it" in result.stdout + result.stderr
+    assert world.run("--no-auto-shutdown").returncode == 0
+
+
+def test_detach_returns_while_the_run_goes_on(world):
+    world.control("hold-gpu-tests")
+    result = world.run("--detach")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Detached" in result.stdout and "--fetch-only" in result.stdout
+    world.wait_for_stage("gpu-tests")
+    assert world.stage_status("reproduce") is None
+    world.release("gpu-tests")
+    world.wait_for_stage("reproduce", "done", timeout=60)
+    deadline = time.time() + 20
+    while not shutdowns(world)[-1].startswith("-h +1 "):
+        assert time.time() < deadline, shutdowns(world)
+        time.sleep(0.05)
+
+
+def test_fetch_only_stops_a_machine_whose_run_ended(world):
+    assert world.run().returncode == 0
+    (world.home / "shutdown.log").unlink()
+    result = world.run("--fetch-only")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert shutdowns(world) == ["-h +1 Layover results fetched"]
+    (world.home / "shutdown.log").unlink()
+    assert world.run("--fetch-only", "--leave-running").returncode == 0
+    assert shutdowns(world) == []
+
+
+def test_fetch_only_leaves_a_running_machine_alone(world):
+    world.control("hold-gpu-tests")
+    process = world.start()
+    try:
+        world.wait_for_stage("gpu-tests")
+        log = world.home / "shutdown.log"
+        before = log.read_text() if log.exists() else ""
+        assert world.run("--fetch-only").returncode == 0
+        assert (log.read_text() if log.exists() else "") == before
+    finally:
+        world.release("gpu-tests")
+        process.wait(timeout=120)
+
+
+def test_stages_runs_only_the_listed_stages_in_the_usual_order(world):
+    result = world.run("--stages", "traces setup smoke")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert world.calls == ["setup", "smoke", "traces"]
+
+
+@pytest.mark.parametrize("args", [["--stages", "setup nonsense"], ["--stages", "setup", "--stage", "smoke"], ["--stages", "setup", "--from", "smoke"]])
+def test_stages_refuses_unknown_names_and_mixing(world, args):
+    result = world.run(*args)
+    assert result.returncode == 2 and not world.ssh_log.exists()
+
+
+# ---- a RunPod pod: a container that stops itself through runpodctl ------------------------------
+
+
+def runpod(world, **env):
+    world.extra_env.update({"RUNPOD_POD_ID": "pod123", "RUNPOD_API_KEY": "pod-scoped", **env})
+    # A pod has no passwordless sudo to fall back on, and needs none.
+    world.control("no-sudo")
+    return ("--runpod", "--remote-dir", "layover-run")
+
+
+def runpodctl_calls(world):
+    path = world.home / "runpodctl.log"
+    return path.read_text().splitlines() if path.exists() else []
+
+
+def stop_timer(world):
+    path = world.state / "stop_timer"
+    return path.read_text().strip() if path.exists() else None
+
+
+def wait_for(predicate, timeout=20):
+    deadline = time.time() + timeout
+    while not predicate():
+        assert time.time() < deadline
+        time.sleep(0.05)
+
+
+def test_a_pod_stops_itself_through_runpodctl_and_never_through_shutdown(world):
+    args = runpod(world)
+    result = world.run(*args)
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "auto-stop: runpodctl" in output and "for pod pod123 (the stop is not tried here)" in output
+    # Preflight never stops the pod to prove that it can.
+    assert not any("stop" in call for call in runpodctl_calls(world))
+    # The dead-man went first, and the end of the run replaced it.
+    wait_for(lambda: stop_timer(world) == "1 Layover run ended")
+    assert shutdowns(world) == []
+    assert "Delete the pod once the results are here" in output
+
+
+def test_the_pods_timer_stops_it_and_a_newer_one_replaces_it(world):
+    args = runpod(world)
+    world.control("hold-gpu-tests")
+    process = world.start(*args)
+    try:
+        world.wait_for_stage("gpu-tests")
+        assert stop_timer(world) == "2880 Layover dead-man limit reached"
+        dead_man = int((world.state / "stop_timer.pid").read_text())
+        os.kill(dead_man, 0)
+    finally:
+        world.release("gpu-tests")
+        process.wait(timeout=120)
+    wait_for(lambda: stop_timer(world) == "1 Layover run ended")
+    with pytest.raises(ProcessLookupError):
+        for _ in range(100):
+            os.kill(dead_man, 0)
+            time.sleep(0.05)
+    # What a timer does when it fires, with the commands of either version of runpodctl.
+    for marker, expected in ((None, "pod stop pod123"), ("runpodctl-v1", "stop pod pod123")):
+        if marker:
+            world.control(marker)
+        fired = subprocess.run(
+            [BASH, "scripts/remote_gpu.sh", "__stop_pod_after", "0", "test"], cwd=world.run_dir,
+            env=dict(world.env, HOME=str(world.home), PATH=f"{world.remote_bin}:/usr/bin:/bin"), capture_output=True, text=True, timeout=30,
+        )
+        assert fired.returncode == 0, fired.stdout + fired.stderr
+        assert "stopping pod pod123: test" in fired.stdout
+        assert runpodctl_calls(world)[-1] == expected
+
+
+def test_a_pod_that_cannot_stop_itself_is_refused_before_anything_runs(world):
+    args = runpod(world)
+    del world.extra_env["RUNPOD_POD_ID"]
+    result = world.run(*args)
+    assert result.returncode == 10 and "RUNPOD_POD_ID is not set" in result.stdout
+    world.extra_env["RUNPOD_POD_ID"] = "pod123"
+    del world.extra_env["RUNPOD_API_KEY"]
+    result = world.run(*args)
+    assert result.returncode == 10 and "RUNPOD_API_KEY is not set" in result.stdout
+    world.extra_env["RUNPOD_API_KEY"] = "pod-scoped"
+    os.remove(world.remote_bin / "runpodctl")
+    result = world.run(*args)
+    assert result.returncode == 10 and "runpodctl is missing" in result.stdout
+    assert world.calls == [] and not world.rsync_log.exists()
+    result = world.run(*args, "--no-auto-shutdown")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_a_pod_runs_on_its_volume_disk_unless_told_otherwise(world):
+    result = world.run("--runpod", "--dry-run")
+    assert "run directory: /workspace/layover-run" in result.stdout
+    assert "the pod stops itself with runpodctl" in result.stdout
+    assert "run directory: elsewhere" in world.run("--runpod", "--remote-dir", "elsewhere", "--dry-run").stdout
+    assert "run directory: layover-run" in world.run("--dry-run").stdout
+
+
+def test_the_caches_go_to_the_volume_and_a_new_container_runs_setup_again(world):
+    args = runpod(world)
+    result = world.run(*args, "--stages", "setup smoke")
+    assert result.returncode == 0, result.stdout + result.stderr
+    cache = world.run_dir / ".cache"
+    assert (world.home / "setup_env.log").read_text().splitlines() == [f"1|{cache}|{cache}/huggingface"]
+    # A restarted pod is a new container: the volume kept the markers, the container disk lost the toolkit.
+    (world.home / ".layover-setup-here").unlink()
+    result = world.run(*args, "--stage", "gpu-tests")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "this container is new" in result.stdout
+    assert world.calls == ["setup", "smoke", "setup", "gpu-tests"]
+    assert (world.home / ".layover-setup-here").exists()
+    # The same container keeps what setup did.
+    assert world.run(*args, "--stage", "gpu-tests").returncode == 0
+    assert world.calls[-1] == "gpu-tests" and world.calls.count("setup") == 2
+
+
+def test_a_machine_is_never_marked_as_a_pod_without_the_flag(world):
+    assert world.run("--stages", "setup").returncode == 0
+    assert not (world.home / ".layover-setup-here").exists()
+    assert "runpod" not in (world.state / "settings").read_text()
+
+
+def test_without_the_traces_stage_docker_is_neither_checked_nor_set_up(world):
+    world.control("docker-broken")
+    result = world.run("--stages", "setup smoke")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "docker: not needed, since the traces stage is not in this run" in result.stdout
+    assert (world.home / "setup_env.log").read_text().split("|")[0] == "1"
+    # With the traces stage, or for a lone preflight, Docker must run a container.
+    assert world.run("--stages", "setup traces").returncode == 10
+    assert world.run("--stage", "preflight").returncode == 10
+
+
+def test_a_containers_memory_limit_is_its_ram(world, tmp_path):
+    cgroup = tmp_path / "cgroup"
+    cgroup.mkdir()
+    world.extra_env["LAYOVER_CGROUP_ROOT"] = str(cgroup)
+    world.control("ram-gib", "512")
+    (cgroup / "memory.max").write_text(f"{50 * 2**30}\n")
+    preflight_refused(world, "ram: 50 GiB, this container's limit on a 512 GiB host", "the machine has 50 GiB of RAM")
+    assert world.run("--min-ram-gb", "48", "--stage", "preflight").returncode == 0
+    # No limit, in either version of cgroups, leaves the host's RAM.
+    (cgroup / "memory.max").write_text("max\n")
+    result = world.run("--stage", "preflight")
+    assert result.returncode == 0 and "ram: 512 GiB" in result.stdout
+    (cgroup / "memory.max").unlink()
+    (cgroup / "memory").mkdir()
+    (cgroup / "memory" / "memory.limit_in_bytes").write_text("9223372036854771712\n")
+    assert "ram: 512 GiB" in world.run("--stage", "preflight").stdout
+
+
+def test_a_root_login_without_rsync_gets_it_installed(world, tmp_path):
+    # A bin with what a bare container has: no rsync until apt-get puts it there.
+    bare = tmp_path / "bare_bin"
+    for tool in ("bash", "cat", "df", "awk", "dirname", "mkdir", "ls", "cut", "head", "tr", "sed", "grep", "hostname", "env", "sleep", "ln"):
+        found = shutil.which(tool)
+        if found:
+            (bare / tool).parent.mkdir(parents=True, exist_ok=True)
+            (bare / tool).symlink_to(found)
+    for stub in ("nvidia-smi", "uname", "getconf", "curl", "runpodctl"):
+        (bare / stub).symlink_to(world.remote_bin / stub)
+    write_executable(bare / "id", '#!/bin/bash\ncase "$1" in -u) echo 0 ;; *) echo root ;; esac\n')
+    write_executable(bare / "apt-get", f'#!/bin/bash\necho "apt-get $*" >> "$HOME/apt.log"\ncase " $* " in *" install "*) ln -sf {shlex.quote(shutil.which("rsync"))} {shlex.quote(str(bare))}/rsync ;; esac\n')
+    args = runpod(world, TEST_REMOTE_PATH=str(bare))
+    result = world.run(*args, "--stage", "preflight", "--no-auto-shutdown")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "rsync: missing; installing it" in result.stdout
+    assert "install -y --no-install-recommends rsync" in (world.home / "apt.log").read_text()

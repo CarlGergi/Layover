@@ -8,8 +8,9 @@ saturates vLLM, found once by calibration and held for every system, so a cell's
 workload/system/load/run: headline-swebench/vllm/load100/3. A server is restarted for every
 run, so no cache state carries over. A failed run is retried once and recorded with its error;
 the report lists whatever is missing. After limits.max_consecutive_failures failed cells in a
-row a system is stopped for this invocation and the others go on, so a broken baseline does not
-bill for hours of attempts; session.json and the report say why.
+row, whichever systems they belong to, the whole matrix stops: something is broken that a person
+must look at, and the machine shuts itself down rather than bill for attempts. session.json and
+the report say why; a resume tries again.
 
 A run's record is fsynced and renamed into place the moment the run ends, and a calibration
 rung's likewise. Rerunning the same command resumes, on this machine or, with results/ restored,
@@ -368,6 +369,27 @@ def plan_groups(config: dict, name: str) -> list[dict]:
         raise Refused(f"no plan {name!r}; the config has {sorted(plans)}")
     entry = plans[name]
     return (plan_groups(config, entry["extends"]) if "extends" in entry else []) + entry.get("groups", [])
+
+
+def plan_matched(config: dict, name: str | None) -> dict:
+    """A plan's changes to the matched settings, after those of any plan it extends."""
+    entry = config.get("plans", {}).get(name) if name else None
+    if entry is None:
+        return {}
+    return {**(plan_matched(config, entry["extends"]) if "extends" in entry else {}), **entry.get("matched", {})}
+
+
+def effective_config(config: dict, name: str | None) -> dict:
+    """The config as a plan runs it. A plan may change matched settings, every system's at once,
+    for example a smaller CPU tier on a machine with less RAM. The manifest records and hashes the
+    result, so a resume at another plan's settings is refused like any other changed config."""
+    changes = plan_matched(config, name)
+    if not changes:
+        return config
+    unknown = sorted(set(changes) - set(config["matched"]))
+    if unknown:
+        raise Refused(f"plan {name!r} changes matched settings the config does not have: {unknown}")
+    return {**config, "matched": {**config["matched"], **changes}}
 
 
 def plan_roles(config: dict, name: str) -> set[str]:
@@ -1717,7 +1739,7 @@ class ElapsedLedger(threading.Thread):
 
 def write_session(out: Path, **facts) -> None:
     """How the latest invocation ended. Each one replaces the last, since a resume reconsiders all of it."""
-    write_json(Path(out) / "session.json", {"budget_skipped": [], "stopped_systems": {}, **facts, "finished_unix": time.time()})
+    write_json(Path(out) / "session.json", {"budget_skipped": [], "stopped_matrix": None, **facts, "finished_unix": time.time()})
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -1747,7 +1769,6 @@ def main(argv=None) -> int:
     if args.no_gpu and not args.pipeline_check:
         raise Refused("--no-gpu measures nothing about a GPU; it is allowed only with --pipeline-check")
     config = load_config(args.config)
-    settings = MatchedSettings.from_config(config["matched"])
     if args.measured_rates and not args.dry_run:
         raise Refused("--measured-rates only changes a --dry-run's estimate")
     if args.preflight_kinds and not args.preflight_only:
@@ -1755,6 +1776,8 @@ def main(argv=None) -> int:
     plan_name = args.plan or config.get("default_plan")
     if plan_name:
         plan_groups(config, plan_name)
+    config = effective_config(config, plan_name)
+    settings = MatchedSettings.from_config(config["matched"])
     rates_source = apply_measured_rates(config, args.measured_rates) if args.measured_rates else None
     if not args.pipeline_check and settings.device != "cuda":
         raise Refused(f"device {settings.device!r} gives no comparable numbers; use --pipeline-check to test the pipeline")
@@ -1896,14 +1919,14 @@ def run_all(ctx: MatrixContext, args, workloads: list[Workload], selected: list[
     refuse_mixed_results(ctx, selected, rates)
 
     skipped: list[str] = []
-    stopped: dict[str, dict] = {}
-    # A count for each system, fresh in each invocation: a resume may be on a machine, or with a fix, that cures it.
-    streaks: dict[str, list[str]] = {}
+    stopped: dict | None = None
+    # Counted afresh in each invocation: a resume may be on a machine, or with a fix, that cures it.
+    streak: list[str] = []
     limit = ctx.limits.get("max_consecutive_failures", MAX_CONSECUTIVE_FAILURES)
     failed = 0
     for index, cell in enumerate(pending):
-        if cell.system in stopped:
-            stopped[cell.system]["skipped"].append(cell.label)
+        if stopped is not None:
+            stopped["skipped"].append(cell.label)
             continue
         if deadline is not None and time.monotonic() >= deadline:
             skipped.append(cell.label)
@@ -1914,21 +1937,20 @@ def run_all(ctx: MatrixContext, args, workloads: list[Workload], selected: list[
         if record["status"] == "ok":
             metrics = record["result"]["metrics"]
             print(f"  ok: mean JCT {metrics['mean_jct_s']:.2f}s, p95 {metrics['p95_jct_s']:.2f}s", flush=True)
-            streaks.pop(cell.system, None)
+            streak = []
             continue
         failed += 1
         error = record["attempts"][-1]["error"]
         print(f"  FAILED after {len(record['attempts'])} attempts: {error[:300]}", flush=True)
-        streak = streaks.setdefault(cell.system, [])
         streak.append(cell.label)
         if len(streak) >= limit:
-            print(f"  {cell.system} stopped after {len(streak)} failed runs in a row; the other systems go on", flush=True)
-            stopped[cell.system] = {"reason": f"{len(streak)} runs in a row failed; the last: {error[:500]}", "failed": streak, "skipped": []}
+            print(f"  STOPPING the matrix: {len(streak)} cells in a row failed", flush=True)
+            stopped = {"reason": f"{len(streak)} cells in a row failed; the last: {error[:500]}", "failed": list(streak), "skipped": []}
     if skipped:
         print(f"Budget reached: skipping {len(skipped)} runs.", flush=True)
-    write_session(ctx.out, budget_skipped=skipped, stopped_systems=stopped)
-    left_out = sum(len(entry["skipped"]) for entry in stopped.values())
-    print(f"Done: {len(pending) - failed - len(skipped) - left_out} ok, {failed} failed, {len(skipped)} skipped by budget, {left_out} skipped with a stopped system.", flush=True)
+    write_session(ctx.out, budget_skipped=skipped, stopped_matrix=stopped)
+    left_out = len(stopped["skipped"]) if stopped else 0
+    print(f"Done: {len(pending) - failed - len(skipped) - left_out} ok, {failed} failed, {len(skipped)} skipped by budget, {left_out} skipped after the stop.", flush=True)
     return 1 if failed or skipped or stopped else 0
 
 

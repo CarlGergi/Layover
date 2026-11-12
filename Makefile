@@ -101,7 +101,7 @@ matrix-report:
 matrix-pipeline-check: smoke
 	$(PYTHON) bench/run_matrix.py --config bench/configs/pipeline_check.json --out results/matrix_pipeline_check --pipeline-check --no-gpu
 
-# Every benchmark number for the chosen plan (--plan in MATRIX_ARGS, default first-pass).
+# Every benchmark number for the chosen plan (--plan in MATRIX_ARGS, default under-20h).
 # Refuses without a CUDA GPU and the re-executed trace; a re-run skips what is finished.
 reproduce: kv-crossover decode-bandwidth transfer-gather matrix-preflight matrix matrix-report
 

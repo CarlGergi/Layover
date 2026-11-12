@@ -10,6 +10,7 @@
 #
 #   --stage NAME            run only this stage, even if done (also preflight or sync alone)
 #   --from NAME             run from this stage on, even if done
+#   --stages "A B ..."      run only these stages, in the usual order, skipping any already done
 #   --continue-on-failure   let later stages run after a failed one
 #   --plan NAME             run this plan of the matrix config (default: the config's default plan);
 #                           smoke prices the same plan, and a change of plan runs smoke again
@@ -19,6 +20,16 @@
 #   --continue-over-budget  go on past smoke even though its low estimate is over --max-hours
 #   --stop-after-smoke      stop after smoke, to read its refined hours before paying for the rest;
 #                           the same command without this flag goes on from there
+#   --detach                start the run and return; nothing here needs to stay awake. Come back
+#                           with --status, or --fetch-only to copy results here
+#   --no-auto-shutdown      leave the machine running when the run ends (it shuts down by default)
+#   --max-session-hours H   dead-man limit: the machine shuts down this long after the run starts,
+#                           whatever is happening (default: 2 with --stop-after-smoke, --max-hours
+#                           plus 6, or 48)
+#   --leave-running         with --fetch-only: do not shut down a machine whose run has ended
+#   --runpod                the machine is a RunPod pod, a container: it stops itself with runpodctl,
+#                           the run directory defaults to /workspace/layover-run on the volume disk,
+#                           which a stop keeps, and the caches go there too (see below)
 #   --restore-from DIR      on a new machine: go on with the session in DIR, results/gpu-<timestamp>.
 #                           Setup and baselines rerun, as they live on the machine. Everything in
 #                           DIR's results/ and traces/ goes up, new results come back to DIR, and
@@ -43,7 +54,22 @@
 #
 # The work runs detached, so an SSH drop or a closed laptop costs nothing: re-running the same
 # command attaches to it, or resumes from the first stage not done. This script never deletes
-# anything on this machine and never stops the instance.
+# anything on this machine.
+#
+# The machine never bills idle. When the run ends, finished, over budget, or failed, it shuts
+# itself down a minute later, which gives a watching session time for its last copy. A shutdown
+# timer set when the run starts covers a hang or a killed runner. On AWS an instance's own
+# shutdown stops it by default and its disk keeps the results; check that the instance's shutdown
+# behavior is Stop, not Terminate, or those results are lost with it. To fetch later, start the
+# instance and run --fetch-only, which shuts it down again afterwards.
+#
+# A RunPod pod is a container, where shutdown does nothing, so with --runpod a timer on the pod
+# asks RunPod to stop it through runpodctl and the pod's own API key, which RunPod gives every
+# pod. A stop ends the GPU's billing and wipes the container disk, while /workspace survives: the
+# run directory, the environments and the model weights live there. The toolkit lives on the
+# container disk, so a run on a restarted pod does setup again. Nothing here needs Docker unless
+# the traces stage is in the run, so a container can run every other stage. Delete the pod once
+# the results are here: a stopped pod still bills for its volume disk.
 #
 # Spot instances. rsync sends only what changed, so results can come back every minute during the
 # stages that run for hours, and run_matrix.py writes each run whole as it ends. So a run that ended
@@ -161,14 +187,116 @@ run_stage_shell() {
     fi
 }
 
+# RunPod hands the pod's id and its own API key to the container's first process, and its images
+# write them to /etc/rp_environment for login shells. A command over ssh gets neither by itself.
+runpod_env() {
+    local line
+    [ -z "${RUNPOD_POD_ID:-}" ] || return 0
+    # shellcheck disable=SC1091
+    [ ! -r /etc/rp_environment ] || . /etc/rp_environment
+    [ -z "${RUNPOD_POD_ID:-}" ] && [ -r /proc/1/environ ] || return 0
+    while IFS= read -r -d '' line; do
+        case "$line" in RUNPOD_POD_ID=*|RUNPOD_API_KEY=*) export "${line?}" ;; esac
+    done < /proc/1/environ
+}
+
+# runpodctl 2 says "pod stop ID", and earlier versions "stop pod ID".
+runpod_ctl() {
+    runpodctl pod "$1" "$2" > /dev/null 2>&1 || runpodctl "$1" pod "$2" > /dev/null 2>&1
+}
+
+cancel_pod_stop() {
+    local pid
+    pid=$(cat "$STATE/stop_timer.pid" 2>/dev/null) || return 0
+    rm -f "$STATE/stop_timer.pid"
+    [ -n "$pid" ] || return 0
+    # Its own process group where setsid exists, so the sleep goes with it.
+    kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+}
+
+# Runs detached, and a newer timer replaces it by killing it.
+stop_pod_after() {
+    echo $$ > "$STATE/stop_timer.pid"
+    printf '%s %s\n' "$1" "$2" > "$STATE/stop_timer"
+    sleep $(($1 * 60))
+    runpod_env
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') stopping pod ${RUNPOD_POD_ID:-unknown}: $2"
+    rm -f "$STATE/stop_timer.pid"
+    runpod_ctl stop "${RUNPOD_POD_ID:-}" || echo "could not stop the pod; it keeps billing until someone does"
+}
+
+schedule_pod_stop() {
+    local detach=
+    cancel_pod_stop
+    command -v setsid >/dev/null 2>&1 && detach=setsid
+    nohup $detach bash "$ROOT/scripts/remote_gpu.sh" __stop_pod_after "$1" "$2" >> "$STATE/logs/stop.log" 2>&1 < /dev/null &
+    for _ in $(seq 100); do
+        [ -s "$STATE/stop_timer.pid" ] && return 0
+        sleep 0.05
+    done
+    return 1
+}
+
+# The machine's own shutdown, so that it never bills idle. Asking for one replaces any pending.
+schedule_shutdown() {
+    [ "$(setting auto_shutdown)" = 1 ] || return 0
+    if [ "$(setting provider)" = runpod ]; then
+        schedule_pod_stop "$1" "$2" && return 0
+    else
+        sudo -n shutdown -h "+$1" "$2" > /dev/null 2>&1 && return 0
+    fi
+    echo "=== WARNING: could not schedule a shutdown; the machine will keep billing until stopped"
+}
+
+# After a fetch, for a machine that was started only to be fetched from.
+stop_machine_soon() {
+    if [ "$(setting provider)" = runpod ]; then
+        schedule_pod_stop 1 "Layover results fetched"
+    else
+        sudo -n shutdown -h +1 "Layover results fetched" > /dev/null
+    fi
+}
+
+runner_ends() {
+    echo "=== runner finished $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    if [ "$(setting auto_shutdown)" = 1 ]; then
+        echo "=== the machine shuts down in a minute (auto-shutdown)"
+        schedule_shutdown 1 "Layover run ended"
+    fi
+}
+
+# On RunPod the volume keeps the run directory through a stop, and the container disk does not:
+# the caches move to the volume, and a new container runs setup again for the toolkit it lost.
+runpod_stage_setup() {
+    local stage
+    export XDG_CACHE_HOME="$ROOT/.cache" HF_HOME="$ROOT/.cache/huggingface" UV_PYTHON_INSTALL_DIR="$ROOT/.cache/uv-python"
+    [ "$(cut -d' ' -f1 "$STATE/stages/setup" 2>/dev/null)" = "done" ] || return 0
+    [ ! -f "$HOME/.layover-setup-here" ] || return 0
+    echo "=== [setup] this container is new, and its disk lost what setup installed: setup runs again"
+    rm -f "$STATE/stages/setup"
+    for stage in "$@"; do
+        [ "$stage" != setup ] || return 0
+    done
+    return 1
+}
+
 remote_runner() {
-    local keep_going=$1 stage start end rc status budget_checked=0
+    local keep_going=$1 stage start end rc status budget_checked=0 minutes
     shift
     echo $$ > "$STATE/runner.pid"
+    trap runner_ends EXIT
+    minutes=$(awk -v h="$(setting deadman_hours)" 'BEGIN { m = int(h * 60); print (m > 0 ? m : 2880) }')
+    [ "$(setting auto_shutdown)" != 1 ] || echo "=== dead-man: the machine shuts down in $minutes minutes whatever happens"
+    schedule_shutdown "$minutes" "Layover dead-man limit reached"
     cd "$ROOT" || exit 1
     unset TRITON_INTERPRET
     export PYTHONUNBUFFERED=1
     export_stage_settings
+    if [ "$(setting provider)" = runpod ]; then
+        runpod_stage_setup "$@" || set -- setup "$@"
+    fi
+    # Only the traces stage runs containers, so setup leaves Docker alone without it.
+    case " $* " in *" traces "*) ;; *) export LAYOVER_NO_DOCKER=1 ;; esac
     for stage in "$@"; do
         status=$(cut -d' ' -f1 "$STATE/stages/$stage" 2>/dev/null)
         if [ "$status" = "done" ]; then
@@ -196,6 +324,7 @@ remote_runner() {
         end=$(date +%s)
         if [ "$rc" -eq 0 ]; then
             write_stage "$stage" "done" "$start" "$end" 0
+            [ "$stage" != setup ] || [ "$(setting provider)" != runpod ] || : > "$HOME/.layover-setup-here"
             echo "=== [$stage] done in $((end - start))s"
         else
             write_stage "$stage" failed "$start" "$end" "$rc"
@@ -203,7 +332,6 @@ remote_runner() {
             [ "$keep_going" = 1 ] || break
         fi
     done
-    echo "=== runner finished $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 }
 
 remote_start() {
@@ -295,6 +423,8 @@ case "${1:-}" in
             __poll) remote_poll "$@" ;;
             __status) remote_status ;;
             __alive) runner_alive && echo 1 || echo 0 ;;
+            __stop_machine) stop_machine_soon ;;
+            __stop_pod_after) stop_pod_after "$@" ;;
             __session) cat "$STATE/session" ;;
             __mark) name=$1; shift; write_stage "$name" "$@" ;;
             # Kept as it was, with the commit it was done at. A marker already here is newer.
@@ -352,10 +482,11 @@ stage_exit_code() {
     esac
 }
 
-HOST="" PORT="" KEY="" ONLY_STAGE="" FROM_STAGE="" HOURLY_USD="" EXTRA_SSH=""
+HOST="" PORT="" KEY="" ONLY_STAGE="" FROM_STAGE="" STAGE_LIST="" HOURLY_USD="" EXTRA_SSH=""
 DRY_RUN=0 STATUS=0 FETCH_ONLY=0 KEEP_GOING=0 SECRET_SCAN=1 PLAN_NAME="" MAX_HOURS="" SAVED_PLAN="" CONTINUE_OVER_BUDGET=0
 REMOTE_DIR=layover-run FETCH_EVERY=600 FETCH_EVERY_RUNS=60 POLL=5 RECONNECT_TIMEOUT=1800 MIN_DISK_GB=200 MIN_GPU_MIB=22000 MIN_RAM_GB=64 ALLOW_IAM_ROLE=0
 STOP_AFTER_SMOKE=0 RESTORE_FROM="" SPOT_NOTICE=0 RESUME_FLAGS=""
+DETACH=0 AUTO_SHUTDOWN=1 MAX_SESSION_HOURS="" LEAVE_RUNNING=0 RUNNER_STARTED=0 PROVIDER="" REMOTE_DIR_GIVEN=0
 
 need_value() { [ "$2" -ge 2 ] || usage_error "$1 needs a value"; }
 need_int() { case "$2" in ''|*[!0-9]*) usage_error "$1 needs a whole number, got '$2'" ;; esac; }
@@ -371,6 +502,7 @@ while [ $# -gt 0 ]; do
         -p) need_value "$1" $#; need_int "$1" "$2"; PORT=$2; shift 2 ;;
         -i) need_value "$1" $#; KEY=$2; shift 2 ;;
         --stage) need_value "$1" $#; ONLY_STAGE=$2; shift 2 ;;
+        --stages) need_value "$1" $#; STAGE_LIST=$2; shift 2 ;;
         --from) need_value "$1" $#; FROM_STAGE=$2; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         --status) STATUS=1; shift ;;
@@ -380,12 +512,17 @@ while [ $# -gt 0 ]; do
         --max-hours) need_value "$1" $#; need_number "$1" "$2"; MAX_HOURS=$2; shift 2 ;;
         --continue-over-budget) CONTINUE_OVER_BUDGET=1; shift ;;
         --stop-after-smoke) STOP_AFTER_SMOKE=1; shift ;;
+        --detach) DETACH=1; shift ;;
+        --no-auto-shutdown) AUTO_SHUTDOWN=0; shift ;;
+        --max-session-hours) need_value "$1" $#; need_number "$1" "$2"; MAX_SESSION_HOURS=$2; shift 2 ;;
+        --leave-running) LEAVE_RUNNING=1; shift ;;
+        --runpod) PROVIDER=runpod; shift ;;
         --spot-notice) SPOT_NOTICE=1; shift ;;
         --restore-from) need_value "$1" $#; RESTORE_FROM=$2; shift 2 ;;
         --no-secret-scan) SECRET_SCAN=0; shift ;;
         --allow-iam-role) ALLOW_IAM_ROLE=1; shift ;;
         --hourly-usd) need_value "$1" $#; need_number "$1" "$2"; HOURLY_USD=$2; shift 2 ;;
-        --remote-dir) need_value "$1" $#; REMOTE_DIR=$2; shift 2 ;;
+        --remote-dir) need_value "$1" $#; REMOTE_DIR=$2; REMOTE_DIR_GIVEN=1; shift 2 ;;
         --ssh-option) need_value "$1" $#; EXTRA_SSH="$EXTRA_SSH
 $2"; shift 2 ;;
         --fetch-every) need_value "$1" $#; need_int "$1" "$2"; FETCH_EVERY=$2; shift 2 ;;
@@ -400,7 +537,7 @@ $2"; shift 2 ;;
     esac
     # What a resume on another machine needs of this command line.
     case "$arg" in
-        --restore-from|--stage|--from|--stop-after-smoke|--status|--fetch-only|--dry-run) ;;
+        --restore-from|--stage|--stages|--from|--stop-after-smoke|--status|--fetch-only|--dry-run|--leave-running) ;;
         -*)
             RESUME_FLAGS="$RESUME_FLAGS $(printf '%q' "$arg")"
             [ $((before - $#)) -lt 2 ] || RESUME_FLAGS="$RESUME_FLAGS $(printf '%q' "$value")"
@@ -425,6 +562,10 @@ fi
 [ -z "$FROM_STAGE" ] || in_list "$FROM_STAGE" "$STAGES" ||
     usage_error "no stage called '$FROM_STAGE'; stages: $STAGES"
 [ -z "$ONLY_STAGE" ] || [ -z "$FROM_STAGE" ] || usage_error "--stage and --from exclude each other"
+[ -z "$STAGE_LIST" ] || [ -z "$ONLY_STAGE$FROM_STAGE" ] || usage_error "--stages excludes --stage and --from"
+for stage in $STAGE_LIST; do
+    in_list "$stage" "$STAGES" || usage_error "no stage called '$stage'; stages: $STAGES"
+done
 [ $((STATUS + FETCH_ONLY)) -le 1 ] || usage_error "--status and --fetch-only exclude each other"
 if [ "$STATUS" = 1 ] || [ "$FETCH_ONLY" = 1 ]; then
     [ -z "$ONLY_STAGE$FROM_STAGE" ] || usage_error "--status and --fetch-only cannot take --stage or --from"
@@ -449,6 +590,8 @@ if [ -n "$RESTORE_FROM" ]; then
     [ -d "$RESTORE_FROM/stages" ] || usage_error "$RESTORE_FROM has no stages/, so it is not a session directory"
 fi
 
+# A pod's home is on the container disk, which a stop wipes.
+[ "$PROVIDER" != runpod ] || [ "$REMOTE_DIR_GIVEN" = 1 ] || REMOTE_DIR=/workspace/layover-run
 # rsync sends the path through the remote shell, which would split a space, and the mirror
 # below must never be pointed at home or at something it does not own.
 REMOTE_DIR=${REMOTE_DIR#\~/}
@@ -503,6 +646,12 @@ if [ -n "$ONLY_STAGE" ]; then
 elif [ -n "$FROM_STAGE" ]; then
     PLAN=$(printf '%s\n' $STAGES | sed -n "/^$FROM_STAGE\$/,\$p" | tr '\n' ' ')
     PLAN=${PLAN% }
+elif [ -n "$STAGE_LIST" ]; then
+    PLAN=""
+    for stage in $STAGES; do
+        in_list "$stage" "$STAGE_LIST" && PLAN="$PLAN $stage"
+    done
+    PLAN=${PLAN# }
 fi
 if [ "$STOP_AFTER_SMOKE" = 1 ]; then
     in_list smoke "$PLAN" || usage_error "--stop-after-smoke: this plan has no smoke stage: $PLAN"
@@ -531,11 +680,23 @@ $1
 EOF
 }
 
+# Long enough for the plan, short enough that a hang does not run for days.
+deadman_hours() {
+    if [ -n "$MAX_SESSION_HOURS" ]; then echo "$MAX_SESSION_HOURS"
+    elif [ "$STOP_AFTER_SMOKE" = 1 ]; then echo 2
+    elif [ -n "$MAX_HOURS" ]; then awk -v h="$MAX_HOURS" 'BEGIN { print h + 6 }'
+    else echo 48
+    fi
+}
+
 settings_text() {
     [ -z "$PLAN_NAME" ] || echo "plan $PLAN_NAME"
     [ -z "$MAX_HOURS" ] || echo "max_hours $MAX_HOURS"
     [ "$ALLOW_IAM_ROLE" = 0 ] || echo "allow_iam_role 1"
     [ "$CONTINUE_OVER_BUDGET" = 0 ] || echo "continue_over_budget 1"
+    echo "auto_shutdown $AUTO_SHUTDOWN"
+    echo "deadman_hours $(deadman_hours)"
+    [ -z "$PROVIDER" ] || echo "provider $PROVIDER"
     return 0
 }
 
@@ -550,7 +711,9 @@ if [ "$DRY_RUN" = 1 ]; then
     elif [ "$FETCH_ONLY" = 1 ]; then
         echo "would only copy results back"
     else
-        printf 'preflight   this machine: tools, make targets, secret scan. remote: ssh, rsync, x86_64, GPU, Docker runs a container, %s GB free, %s GiB RAM, no IAM role\n' "$MIN_DISK_GB" "$MIN_RAM_GB"
+        printf 'preflight   this machine: tools, make targets, secret scan. remote: ssh, rsync, x86_64, GPU, %s, %s GB free, %s GiB RAM, no IAM role\n' \
+            "$([ -n "$PLAN" ] && ! in_list traces "$PLAN" && echo 'no Docker needed' || echo 'Docker runs a container')" "$MIN_DISK_GB" "$MIN_RAM_GB"
+        [ "$PROVIDER" != runpod ] || echo "runpod      the pod stops itself with runpodctl; run directory and caches on the volume disk"
         if [ "$ONLY_STAGE" != preflight ]; then
             printf 'sync       '; printf ' %q' "${RSYNC[@]}" --delete --exclude=/traces/ "${SYNC_EXCLUDES[@]}" "$ROOT/" "$HOST:$REMOTE_DIR/"; echo
             printf 'sync-traces'; printf ' %q' "${RSYNC[@]}" --update "${SYNC_EXCLUDES[@]}" "$ROOT/traces/" "$HOST:$REMOTE_DIR/traces/"; echo
@@ -595,11 +758,23 @@ on_exit() {
 EOF
         return
     fi
+    # Only a run on the machine shuts it down: a failed preflight or sync leaves it idle.
+    if [ "$AUTO_SHUTDOWN" = 1 ] && [ "$RUNNER_STARTED" = 1 ]; then
+        cat <<EOF
+
+================================================================================
+  The machine shuts itself down when its run ends, and at the latest $(deadman_hours) hours
+  after it started. Re-run to attach, --status to check, --fetch-only to copy results.
+  $([ "$PROVIDER" = runpod ] && echo 'Delete the pod once the results are here: stopped, it still bills for its disk.' || echo "Terminate the instance in your provider's console once the results are here.")
+================================================================================
+EOF
+        return
+    fi
     cat <<EOF
 
 ================================================================================
-  The instance is still running, and still billing. This script never stops it.
-  Re-run to attach or resume. Once results are back, terminate it in your provider's console.
+  The instance is still running, and still billing$([ "$AUTO_SHUTDOWN" = 1 ] && echo ': no run started on it, so nothing' || echo ' (--no-auto-shutdown)').
+  $([ "$AUTO_SHUTDOWN" = 1 ] && echo 'will stop it. Fix the problem and re-run, or stop it in your provider'"'"'s console.' || echo 'Re-run to attach or resume. Once results are back, terminate it in your provider'"'"'s console.')
 ================================================================================
 EOF
 }
@@ -711,7 +886,7 @@ describe_commit() {
 preflight_script() {
     cat <<'REMOTE'
 set -u
-dir=$1 min_gb=$2 min_gpu_mib=$3 min_ram_gb=$4 allow_iam_role=$5
+dir=$1 min_gb=$2 min_gpu_mib=$3 min_ram_gb=$4 allow_iam_role=$5 auto_shutdown=$6 need_docker=${7:-1} provider=${8:-}
 status=0
 problem() { echo "PROBLEM: $*"; status=1; }
 gb_free() { df -Pk "$1" | awk 'NR == 2 { print int($4 / 1048576) }'; }
@@ -719,6 +894,11 @@ gb_free() { df -Pk "$1" | awk 'NR == 2 { print int($4 / 1048576) }'; }
 echo "machine: $(hostname), $(uname -sm), user $(id -un)"
 [ "$(uname -s)" = Linux ] || problem "this machine runs $(uname -s), and CUDA needs Linux"
 [ "$(uname -m)" = x86_64 ] || problem "this machine is $(uname -m); the task containers for trace re-execution are x86_64 images"
+# Rented containers often lack it, and log in as root, so it can go in here before the sync needs it.
+if ! command -v rsync >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ] && command -v apt-get >/dev/null 2>&1; then
+    echo "rsync: missing; installing it"
+    { apt-get -o DPkg::Lock::Timeout=300 update && DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends rsync; } > /dev/null 2>&1
+fi
 command -v rsync >/dev/null 2>&1 || problem "rsync is missing on the machine; install it (apt-get install rsync)"
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
@@ -741,7 +921,9 @@ fi
 container_hint="Trace re-execution needs a Docker daemon that can run containers. Rental offerings
 that are themselves containers commonly cannot do that; rent a VM or bare metal instead."
 docker_root=/var/lib
-if command -v docker >/dev/null 2>&1; then
+if [ "$need_docker" != 1 ]; then
+    echo "docker: not needed, since the traces stage is not in this run"
+elif command -v docker >/dev/null 2>&1; then
     limit=
     command -v timeout >/dev/null 2>&1 && limit="timeout 300"
     if out=$($limit docker run --rm hello-world 2>&1); then
@@ -765,6 +947,13 @@ fi
 # Layover's 32 GiB tier pins real memory on top of its host cache, up to 48 GiB in all, the
 # crossover adds about 10 GiB, and the baselines are given matched CPU budgets. Running short
 # shows up hours in, as a lost cell or the OOM killer.
+# A container sees its host's RAM through getconf, and gets only its cgroup's limit.
+cgroup_mib() {
+    local root=${LAYOVER_CGROUP_ROOT:-/sys/fs/cgroup} raw
+    raw=$(cat "$root/memory.max" 2>/dev/null || cat "$root/memory/memory.limit_in_bytes" 2>/dev/null) || return 1
+    case "$raw" in ''|*[!0-9]*) return 1 ;; esac
+    echo $((raw / 1048576))
+}
 if [ "$min_ram_gb" -gt 0 ]; then
     pages=$(getconf _PHYS_PAGES 2>/dev/null)
     page_size=$(getconf PAGESIZE 2>/dev/null)
@@ -772,7 +961,13 @@ if [ "$min_ram_gb" -gt 0 ]; then
         problem "cannot read this machine's RAM with getconf; check it holds ${min_ram_gb} GiB, then pass --min-ram-gb 0"
     else
         ram_mib=$((pages / 1024 * page_size / 1024))
-        echo "ram: $((ram_mib / 1024)) GiB"
+        limit_mib=$(cgroup_mib) || limit_mib=$ram_mib
+        if [ "$limit_mib" -lt "$ram_mib" ]; then
+            echo "ram: $((limit_mib / 1024)) GiB, this container's limit on a $((ram_mib / 1024)) GiB host"
+            ram_mib=$limit_mib
+        else
+            echo "ram: $((ram_mib / 1024)) GiB"
+        fi
         # The kernel keeps a few percent, so a machine sold as 64 GiB reports about 62.
         [ $((ram_mib * 100)) -ge $((min_ram_gb * 1024 * 95)) ] || problem "the machine has $((ram_mib / 1024)) GiB of RAM, and Layover's pinned memory, the crossover and the baselines' matched CPU budgets need ${min_ram_gb} GiB; rent a larger one, or lower this with --min-ram-gb"
     fi
@@ -800,15 +995,56 @@ else
     fi
 fi
 
+# Without this the machine cannot stop itself, and bills idle after the run. On RunPod the pod's
+# own key may stop the pod but not read it (runpodctl 1.14 answers a read with Unauthorized), so
+# nothing here can prove the stop short of making it: this checks that its pieces are in place.
+if [ "$auto_shutdown" = 1 ] && [ "$provider" = runpod ]; then
+    if [ -z "${RUNPOD_POD_ID:-}" ] && [ -r /etc/rp_environment ]; then
+        # shellcheck disable=SC1091
+        . /etc/rp_environment
+    fi
+    if [ -z "${RUNPOD_POD_ID:-}" ] && [ -r /proc/1/environ ]; then
+        while IFS= read -r -d '' line; do
+            case "$line" in RUNPOD_POD_ID=*|RUNPOD_API_KEY=*) export "${line?}" ;; esac
+        done < /proc/1/environ
+    fi
+    if [ -z "${RUNPOD_POD_ID:-}" ]; then
+        problem "--runpod, but RUNPOD_POD_ID is not set here, so this does not look like a RunPod pod and could not stop itself"
+    elif ! command -v runpodctl >/dev/null 2>&1; then
+        problem "runpodctl is missing, so the pod cannot stop itself; install it, or pass --no-auto-shutdown and stop the pod yourself"
+    elif [ -z "${RUNPOD_API_KEY:-}" ]; then
+        problem "RUNPOD_API_KEY is not set here, so runpodctl could not stop pod $RUNPOD_POD_ID; pass --no-auto-shutdown and stop the pod yourself"
+    else
+        echo "auto-stop: runpodctl $(runpodctl --version 2>/dev/null | head -n1 | awk '{ print $NF }') with this pod's key, for pod $RUNPOD_POD_ID (the stop is not tried here)"
+    fi
+elif [ "$auto_shutdown" = 1 ]; then
+    if command -v shutdown >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        echo "auto-shutdown: possible (passwordless sudo)"
+    else
+        problem "auto-shutdown needs shutdown and passwordless sudo on the machine; fix that, or pass --no-auto-shutdown and stop it yourself"
+    fi
+fi
+
 # On a resume, setup and the task images have already spent most of that disk.
 if [ "$(cut -d' ' -f1 "$dir/.layover-run/stages/setup" 2>/dev/null)" = "done" ]; then
     min_gb=$((min_gb < 5 ? min_gb : 5))
 fi
-[ -d "$docker_root" ] || docker_root=/
-free_gb=$(gb_free "$docker_root")
-echo "free disk: ${free_gb} GB at $docker_root, $(gb_free .) GB here"
-[ "$free_gb" -ge "$min_gb" ] || problem "only ${free_gb} GB free at $docker_root, and the task images and everything else need ${min_gb} GB; attach a larger disk, or lower this with --min-disk-gb"
-[ "$(gb_free .)" -ge "$((min_gb < 60 ? min_gb : 60))" ] || problem "only $(gb_free .) GB free here, and the toolkit, torch, weights and baselines need about 60 GB"
+# The run directory's filesystem is that of the nearest directory on its way that exists.
+here=$dir
+while [ ! -d "$here" ]; do here=$(dirname "$here"); done
+if [ "$need_docker" = 1 ]; then
+    [ -d "$docker_root" ] || docker_root=/
+    free_gb=$(gb_free "$docker_root")
+    echo "free disk: ${free_gb} GB at $docker_root, $(gb_free "$here") GB at $here"
+    [ "$free_gb" -ge "$min_gb" ] || problem "only ${free_gb} GB free at $docker_root, and the task images and everything else need ${min_gb} GB; attach a larger disk, or lower this with --min-disk-gb"
+else
+    echo "free disk: $(gb_free "$here") GB at $here"
+fi
+[ "$(gb_free "$here")" -ge "$((min_gb < 60 ? min_gb : 60))" ] || problem "only $(gb_free "$here") GB free at $here, and the toolkit, torch, weights and baselines need about 60 GB"
+# The CUDA toolkit goes to /usr/local, which on a pod is the container disk and not the volume.
+if [ "$provider" = runpod ] && [ "$(gb_free /)" -lt "$((min_gb < 15 ? min_gb : 15))" ]; then
+    problem "only $(gb_free /) GB free on the container disk, and the CUDA toolkit needs about 15 GB; create the pod with a larger container disk"
+fi
 
 # sync mirrors with --delete, so it only ever touches a directory this tool made.
 if [ -d "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ] && [ ! -d "$dir/.layover-run" ]; then
@@ -863,7 +1099,10 @@ run_preflight() {
     COMMIT=$(describe_commit) || fail 10 "could not hash the files to sync"
     echo "commit: $COMMIT"
     say "preflight: $HOST"
-    output=$(preflight_script | ssh "${SSH_CMD[@]}" "$HOST" "bash -s -- $(q "$REMOTE_DIR") $MIN_DISK_GB $MIN_GPU_MIB $MIN_RAM_GB $ALLOW_IAM_ROLE" 2>&1)
+    # Preflight alone checks for everything a session may run.
+    need_docker=1
+    [ -z "$PLAN" ] || in_list traces "$PLAN" || need_docker=0
+    output=$(preflight_script | ssh "${SSH_CMD[@]}" "$HOST" "bash -s -- $(q "$REMOTE_DIR") $MIN_DISK_GB $MIN_GPU_MIB $MIN_RAM_GB $ALLOW_IAM_ROLE $AUTO_SHUTDOWN $need_docker ${PROVIDER:-none}" 2>&1)
     rc=$?
     printf '%s\n' "$output"
     if [ "$rc" -eq 255 ]; then
@@ -1172,9 +1411,21 @@ finish() {
     fi
     echo "Results: $SESSION_DIR"
     if [ "$STOP_AFTER_SMOKE" = 1 ] && [ "$code" = 0 ]; then
-        printf '\nStopped after smoke, as asked. The instance is still billing. To go on, run the same command without --stop-after-smoke.\n'
+        printf '\nStopped after smoke, as asked. To go on, run the same command without --stop-after-smoke%s.\n' "$([ "$AUTO_SHUTDOWN" = 1 ] && echo ', after starting the instance again: it shuts itself down now' || echo '; the instance is still billing')"
     fi
     exit "$code"
+}
+
+# After a --fetch-only whose copy came back whole, the machine that was started for it stops again.
+final_fetch_then_stop() {
+    local rc=$?
+    if [ "$FETCH_FAILED" = 0 ] && rrun __stop_machine > /dev/null 2>&1; then
+        echo "The machine shuts down in a minute. --leave-running keeps it up."
+    else
+        warn "the machine was not shut down; stop it yourself"
+    fi
+    on_exit
+    exit "$rc"
 }
 
 # ---- what this invocation does ----------------------------------------------------------
@@ -1189,6 +1440,12 @@ fi
 
 if [ "$FETCH_ONLY" = 1 ]; then
     load_session || fail 18 "no session in $REMOTE_DIR on $HOST: the machine is unreachable, or nothing was synced yet"
+    # A machine started only to fetch from goes back down, unless its run is still going.
+    if probe_alive; then
+        RUNNER_STARTED=1
+    elif [ "$AUTO_SHUTDOWN" = 1 ] && [ "$LEAVE_RUNNING" = 0 ]; then
+        trap 'final_fetch_then_stop' EXIT
+    fi
     finish
 fi
 
@@ -1197,6 +1454,7 @@ if probe_alive; then
     [ -z "$ONLY_STAGE$FROM_STAGE" ] ||
         fail 1 "a runner is going on the machine. Wait for it, or stop it (--status shows how), before starting other stages."
     echo "A runner is already going on the machine; attaching to it."
+    RUNNER_STARTED=1
     [ "$STOP_AFTER_SMOKE" = 0 ] || warn "--stop-after-smoke applies only when a run starts; this one keeps its own plan"
     [ -z "$PLAN_NAME$MAX_HOURS" ] || warn "--plan and --max-hours apply only when a run starts; this one keeps its own"
     PLAN_NAME="" MAX_HOURS=""
@@ -1247,6 +1505,13 @@ else
     say "Starting on the machine: $PLAN"
     # shellcheck disable=SC2086
     rrun __start "$KEEP_GOING" $PLAN > /dev/null || fail 1 "could not start the remote run"
+    RUNNER_STARTED=1
+fi
+if [ "$DETACH" = 1 ]; then
+    say "Detached. The run goes on without this machine."
+    echo "Check on it:     $0 $HOST$RESUME_FLAGS --status"
+    echo "Copy results:    $0 $HOST$RESUME_FLAGS --fetch-only"
+    exit 0
 fi
 watch_runner
 finish

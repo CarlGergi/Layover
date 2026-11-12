@@ -142,7 +142,7 @@ def records_of(runs: dict, workload: str, system: str | None = None, load: str |
 def missing_runs(manifest: dict, runs: dict, session: dict) -> list[dict]:
     """Every expected run without a successful result, and why."""
     skipped = set(session.get("budget_skipped", []))
-    stopped = {label: name for name, entry in session.get("stopped_systems", {}).items() for label in entry["skipped"]}
+    stopped = set((session.get("stopped_matrix") or {}).get("skipped", []))
     blocked = set((session.get("calibration_failed") or {}).get("skipped", []))
     missing = []
     for cell in manifest["cells"]:
@@ -156,7 +156,7 @@ def missing_runs(manifest: dict, runs: dict, session: dict) -> list[dict]:
         elif label in skipped:
             reason = "skipped by the time budget"
         elif label in stopped:
-            reason = f"skipped because {stopped[label]} was stopped"
+            reason = "skipped because the matrix stopped"
         elif label in blocked:
             reason = "skipped because calibration failed"
         else:
@@ -801,9 +801,10 @@ def session_section(session: dict, ledger: dict) -> list[str]:
     skipped = session.get("budget_skipped", [])
     if skipped:
         lines += [f"**TIME BUDGET REACHED: {len(skipped)} runs were not run: {_count_by_system_and_load(skipped)}. Each is listed under Missing runs.**", ""]
-    for system, entry in session.get("stopped_systems", {}).items():
-        left = f"{len(entry['skipped'])} more of its runs were skipped: {_count_by_system_and_load(entry['skipped'])}" if entry["skipped"] else "No more of its runs were left"
-        lines += [f"**{system} STOPPED: {entry['reason']}. {left}. The other systems went on.**", ""]
+    entry = session.get("stopped_matrix")
+    if entry:
+        left = f"{len(entry['skipped'])} runs were not run: {_count_by_system_and_load(entry['skipped'])}" if entry["skipped"] else "No runs were left"
+        lines += [f"**MATRIX STOPPED: {entry['reason']}. {left}. A rerun tries again.**", ""]
     failed = session.get("calibration_failed")
     if failed:
         lines += [f"**CALIBRATION FAILED: {failed['reason']}. {len(failed['skipped'])} runs were not run. What it measured is saved, and a rerun resumes it.**", ""]

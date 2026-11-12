@@ -512,7 +512,7 @@ def published_plan(qwen3_4b_config, name="first-pass"):
 
 def test_the_first_pass_plan_is_what_was_asked_for_in_the_order_asked(qwen3_4b_config):
     config, cells = published_plan(qwen3_4b_config)
-    assert config["default_plan"] == "first-pass" and len(cells) == 60 and len(set(cells)) == 60
+    assert len(cells) == 60 and len(set(cells)) == 60
     assert {c.workload for c in cells} == {"headline-swebench"}
     # Headline load100, 3 systems x 5 runs, first, each run round before the next.
     first = cells[:15]
@@ -535,6 +535,47 @@ def test_the_full_plan_extends_first_pass_with_the_sweeps(qwen3_4b_config):
     rest = full[60:]
     assert rest and all(c.workload.startswith("sweep-") and c.load == "load100" for c in rest)
     assert {c.system for c in rest} == set(HEADLINE) and {c.run for c in rest} == set(range(5))
+
+
+def test_the_runpod_plan_puts_layover_against_vllm_first_then_sglang_then_ablations(qwen3_4b_config):
+    _, cells = published_plan(qwen3_4b_config, "runpod-l4")
+    assert len(cells) == 12 + 6 + 10 and len(set(cells)) == len(cells)
+    pairs = {"layover-combined", "vllm"}
+    assert {(c.system, c.load, c.run) for c in cells[:12]} == {(s, l, r) for s in pairs for l in ("load100", "load125") for r in range(3)}
+    # Each run round at both loads before the next, so a budget stop leaves both loads evenly short.
+    assert [(c.load, c.run) for c in cells[:4]] == [("load100", 0)] * 2 + [("load125", 0)] * 2
+    assert {(c.system, c.load, c.run) for c in cells[12:18]} == {("sglang", l, r) for l in ("load100", "load125") for r in range(3)}
+    assert {(c.system, c.load, c.run) for c in cells[18:]} == {(s, "load100", r) for s in ABLATIONS for r in range(2)}
+
+
+def test_a_plan_changes_the_matched_settings_of_every_system_and_nothing_else():
+    config = run_matrix.load_config(REPO / "bench/configs/matrix.json")
+    runpod = run_matrix.effective_config(config, "runpod-l4")
+    assert runpod["matched"] == {**config["matched"], "cpu_offload_gib": 24.0}
+    assert {key: value for key, value in runpod.items() if key != "matched"} == {k: v for k, v in config.items() if k != "matched"}
+    assert config["matched"]["cpu_offload_gib"] == 32.0, "the loaded config must not change"
+    for plan in ("under-20h", "first-pass", None, "not-a-plan"):
+        assert run_matrix.effective_config(config, plan) is config
+    # What a plan extends comes first, and the plan's own changes win.
+    config["plans"]["child"] = {"extends": "runpod-l4", "description": "x", "matched": {"kv_gib": 10.0}, "groups": []}
+    assert run_matrix.effective_config(config, "child")["matched"] == {**config["matched"], "cpu_offload_gib": 24.0, "kv_gib": 10.0}
+    config["plans"]["typo"] = {"description": "x", "matched": {"cpu_offload_gb": 24.0}, "groups": []}
+    with pytest.raises(Refused, match="cpu_offload_gb"):
+        run_matrix.effective_config(config, "typo")
+
+
+def test_main_runs_a_plan_at_its_own_settings(monkeypatch, qwen3_4b_config):
+    seen = {}
+
+    def record(config, settings, *args, **kwargs):
+        seen["config"], seen["settings"] = config, settings
+        return 0.0
+
+    monkeypatch.setattr(run_matrix, "dry_run", record)
+    assert run_matrix.main(["--config", str(REPO / "bench/configs/matrix.json"), "--dry-run", "--plan", "runpod-l4"]) == 0
+    assert seen["settings"].cpu_offload_gib == 24.0 and seen["config"]["matched"]["cpu_offload_gib"] == 24.0
+    assert run_matrix.main(["--config", str(REPO / "bench/configs/matrix.json"), "--dry-run", "--plan", "under-20h"]) == 0
+    assert seen["settings"].cpu_offload_gib == 32.0
 
 
 def test_a_plan_with_an_unknown_name_or_system_is_refused(qwen3_4b_config):
@@ -766,13 +807,24 @@ def qwen3_4b_config(monkeypatch):
     return config
 
 
-def test_dry_run_prints_every_command_and_an_estimate_without_starting_anything(capsys, monkeypatch, qwen3_4b_config):
+def config_without_its_trace(tmp_path) -> Path:
+    """The published config as it is before the GPU machine builds the trace, whether or not this
+    checkout already holds one."""
+    config = run_matrix.load_config(REPO / "bench/configs/matrix.json")
+    config["workloads"][0]["trace"] = "traces/never-built-for-this-test.jsonl"
+    assert not (REPO / config["workloads"][0]["trace"]).exists()
+    path = tmp_path / "matrix.json"
+    path.write_text(json.dumps(config))
+    return path
+
+
+def test_dry_run_prints_every_command_and_an_estimate_without_starting_anything(capsys, monkeypatch, qwen3_4b_config, tmp_path):
     def explode(*_, **__):
         raise AssertionError("a dry run must start nothing")
 
     monkeypatch.setattr(run_matrix, "ManagedServer", explode)
     monkeypatch.setattr(run_matrix, "NvmlBackend", explode)
-    assert run_matrix.main(["--config", str(REPO / "bench/configs/matrix.json"), "--dry-run", "--out", "/nonexistent"]) == 0
+    assert run_matrix.main(["--config", str(config_without_its_trace(tmp_path)), "--dry-run", "--plan", "first-pass", "--out", "/nonexistent"]) == 0
     printed = capsys.readouterr().out
     for name in ("layover-combined", "layover-keep_ttl", "layover-swap", "layover-discard", "layover-discard-nocache", "layover-combined-bf16", "vllm", "sglang"):
         assert f"# {name}\n" in printed
@@ -926,14 +978,16 @@ def test_pins_and_flag_reasons_agree_with_the_code():
     assert not {flag for flag in used if f"`{flag}" not in table}
 
 
-def test_published_configs_expand_cleanly(qwen3_4b_config):
+def test_published_configs_expand_cleanly(qwen3_4b_config, tmp_path):
     config = run_matrix.load_config(REPO / "bench/configs/matrix.json")
     settings = MatchedSettings.from_config(config["matched"])
     assert settings == SETTINGS
     assert config["runs"] == 5 and config["matched"]["dtype"] == "bf16"
-    workloads = run_matrix.load_workloads(config, settings, False, dry_run=True)
-    assert workloads[0].role == "headline" and workloads[0].unavailable
     assert config["workloads"][0]["trace"] == "traces/swebench_30.jsonl"
+    # Before the trace is built, the headline workload is there and says it cannot run yet.
+    unbuilt = run_matrix.load_config(config_without_its_trace(tmp_path))
+    workloads = run_matrix.load_workloads(unbuilt, settings, False, dry_run=True)
+    assert workloads[0].role == "headline" and workloads[0].unavailable
     # Set on a baseline, so a load that suits Layover cannot be the reason it wins.
     assert config["calibration"]["system"] == "vllm"
     specs = {spec["name"]: spec for spec in run_matrix.system_specs(config)}
@@ -2726,22 +2780,40 @@ def failure_ctx(tmp_path, monkeypatch, runs=5, fail=lambda cell: cell.system == 
     return ctx, workloads, calls
 
 
-def test_a_system_failing_repeatedly_is_stopped_and_the_others_go_on(tmp_path, monkeypatch):
-    ctx, workloads, calls = failure_ctx(tmp_path, monkeypatch)
+def test_three_failed_cells_in_a_row_stop_the_whole_matrix(tmp_path, monkeypatch):
+    # From run 2 on every cell fails, whichever system it belongs to.
+    ctx, workloads, calls = failure_ctx(tmp_path, monkeypatch, fail=lambda cell: cell.run >= 2)
     cells = run_matrix.build_cells(workloads, 5)
+    order = [cell.label for cell in cells]
     assert run_matrix.run_all(ctx, resume_args(), workloads, cells, None) == 1
-    # Three failed cells at two attempts each, and no fourth.
-    assert sum("vllm" in call for call in calls) == 3 * 2
-    assert sum("layover-combined" in call for call in calls) == 5
+    first = next(i for i, cell in enumerate(cells) if cell.run >= 2)
+    # Three failed cells at two attempts each, then nothing more.
+    assert len(calls) == first + 3 * 2
     session = json.loads((tmp_path / "session.json").read_text())
-    stopped = session["stopped_systems"]["vllm"]
-    assert "3 runs in a row failed" in stopped["reason"] and "wrong token count" in stopped["reason"]
-    assert stopped["failed"] == [f"w/vllm/load100/{run}" for run in range(3)]
-    assert stopped["skipped"] == ["w/vllm/load100/3", "w/vllm/load100/4"]
+    stopped = session["stopped_matrix"]
+    assert "3 cells in a row failed" in stopped["reason"] and "wrong token count" in stopped["reason"]
+    assert stopped["failed"] == order[first:first + 3]
+    assert stopped["skipped"] == order[first + 3:]
     assert session["budget_skipped"] == []
     text = report.write_report(tmp_path).read_text()
-    assert "**vllm STOPPED: 3 runs in a row failed" in text and "The other systems went on" in text
-    assert "`w/vllm/load100/4`: skipped because vllm was stopped" in text
+    assert "**MATRIX STOPPED: 3 cells in a row failed" in text
+    assert f"`{order[-1]}`: skipped because the matrix stopped" in text
+
+
+def test_one_system_failing_between_successes_does_not_stop_the_matrix(tmp_path, monkeypatch):
+    ctx, workloads, calls = failure_ctx(tmp_path, monkeypatch)
+    cells = run_matrix.build_cells(workloads, 5)
+    # The systems alternate, so vllm's failures never make three in a row.
+    run_matrix.run_all(ctx, resume_args(), workloads, cells, None)
+    assert json.loads((tmp_path / "session.json").read_text())["stopped_matrix"] is None
+    assert len(set(calls)) == len(cells)
+
+
+def test_failures_spread_across_systems_count_as_one_streak(tmp_path, monkeypatch):
+    ctx, workloads, calls = failure_ctx(tmp_path, monkeypatch, runs=3, fail=lambda cell: True)
+    cells = run_matrix.build_cells(workloads, 3)
+    run_matrix.run_all(ctx, resume_args(), workloads, cells, None)
+    assert len(set(calls)) == 3
 
 
 def test_a_success_clears_the_failure_count_and_the_limit_comes_from_the_config(tmp_path, monkeypatch):
@@ -2749,11 +2821,12 @@ def test_a_success_clears_the_failure_count_and_the_limit_comes_from_the_config(
     ctx, workloads, calls = failure_ctx(tmp_path, monkeypatch, runs=6, fail=lambda cell: cell.system == "vllm" and cell.run % 2 == 0)
     cells = run_matrix.build_cells(workloads, 6)
     run_matrix.run_all(ctx, resume_args(), workloads, cells, None)
-    assert json.loads((tmp_path / "session.json").read_text())["stopped_systems"] == {}
+    assert json.loads((tmp_path / "session.json").read_text())["stopped_matrix"] is None
     ctx, workloads, calls = failure_ctx(tmp_path / "strict", monkeypatch, runs=3)
     ctx.limits = {**ctx.limits, "max_consecutive_failures": 1}
     run_matrix.run_all(ctx, resume_args(), workloads, run_matrix.build_cells(workloads, 3), None)
     assert sum("vllm" in call for call in calls) == 2
+    assert all("vllm" not in call for call in calls[calls.index(next(c for c in calls if "vllm" in c)) + 2:])
 
 
 def test_a_resume_gives_a_stopped_system_another_chance(tmp_path, monkeypatch):
@@ -2762,7 +2835,7 @@ def test_a_resume_gives_a_stopped_system_another_chance(tmp_path, monkeypatch):
     run_matrix.run_all(ctx, resume_args(), workloads, cells, None)
     monkeypatch.setattr(run_matrix, "measure_run", lambda *_: fake_result(10.0))
     assert run_matrix.run_all(ctx, resume_args(), workloads, cells, None) == 0
-    assert json.loads((tmp_path / "session.json").read_text())["stopped_systems"] == {}
+    assert json.loads((tmp_path / "session.json").read_text())["stopped_matrix"] is None
     assert "STOPPED" not in report.write_report(tmp_path).read_text()
 
 
@@ -3080,14 +3153,16 @@ def test_a_higher_limit_on_a_resume_gives_room_for_what_is_left(tmp_path):
 # ---- plans --------------------------------------------------------------------------------------------
 
 
-def test_under_20h_is_load100_first_then_load125_then_the_ablations(qwen3_4b_config):
-    _, cells = published_plan(qwen3_4b_config, "under-20h")
-    assert len(cells) == 15 + 9 + 15 and len(set(cells)) == len(cells)
+def test_under_20h_is_load100_first_then_load125_then_the_ablations_then_the_low_load_check(qwen3_4b_config):
+    config, cells = published_plan(qwen3_4b_config, "under-20h")
+    assert config["default_plan"] == "under-20h"
+    assert len(cells) == 15 + 9 + 15 + 2 and len(set(cells)) == len(cells)
     assert {(c.system, c.run) for c in cells[:15]} == {(s, r) for s in HEADLINE for r in range(5)} and {c.load for c in cells[:15]} == {"load100"}
     assert [c.run for c in cells[:15]] == [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4]
     assert {(c.system, c.run) for c in cells[15:24]} == {(s, r) for s in HEADLINE for r in range(3)} and {c.load for c in cells[15:24]} == {"load125"}
-    assert {(c.system, c.load, c.run) for c in cells[24:]} == {(s, "load100", r) for s in ABLATIONS for r in range(3)}
-    assert not any(c.load == "load50" for c in cells)
+    assert {(c.system, c.load, c.run) for c in cells[24:39]} == {(s, "load100", r) for s in ABLATIONS for r in range(3)}
+    # Last, so a budget stop drops them first: one 50% run each, a sanity check only.
+    assert [(c.system, c.load, c.run) for c in cells[39:]] == [("layover-combined", "load50", 0), ("vllm", "load50", 0)]
 
 
 def test_three_loads_lean_is_three_runs_at_each_load_then_two_of_each_ablation(qwen3_4b_config):
@@ -3099,7 +3174,7 @@ def test_three_loads_lean_is_three_runs_at_each_load_then_two_of_each_ablation(q
 
 
 def test_every_new_plan_can_compare_each_ablation_on_seeds_the_reference_has(qwen3_4b_config):
-    for name in ("under-20h", "three-loads-lean"):
+    for name in ("under-20h", "three-loads-lean", "runpod-l4"):
         _, cells = published_plan(qwen3_4b_config, name)
         reference = {c.run for c in cells if c.system == "layover-combined" and c.load == "load100"}
         for system in ABLATIONS:
@@ -3130,6 +3205,6 @@ def test_the_dry_run_prices_every_plan_in_matrix_hours(capsys, qwen3_4b_config):
     systems = {spec["name"]: build_system(spec, SETTINGS, TOKEN_BYTES) for spec in run_matrix.system_specs(config)}
     run_matrix.dry_run(config, SETTINGS, systems, workloads, run_matrix.plan_cells(config, workloads, "first-pass"), pool_tokens=87381, plan_name="first-pass")
     printed = capsys.readouterr().out
-    for name, runs in (("first-pass", 60), ("under-20h", 39), ("three-loads-lean", 37)):
+    for name, runs in (("first-pass", 60), ("under-20h", 41), ("three-loads-lean", 37), ("runpod-l4", 28)):
         assert re.search(rf"  {name}: {runs} runs, [\d.]+ to [\d.]+ matrix hours\.", printed)
 

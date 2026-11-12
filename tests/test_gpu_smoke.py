@@ -303,6 +303,16 @@ def test_the_server_gets_the_matrix_flags_and_the_smokes_cost_model(tmp_path):
     assert flags["--prefill-chunk"] == str(matched["prefill_chunk"]) and "--no-prefix-cache" not in command
 
 
+def test_the_server_runs_at_the_settings_of_the_plan_being_priced(tmp_path):
+    def cpu_tier(plan):
+        ctx = Context("cuda", "Qwen/Qwen3-4B", str(smoke.DEFAULT_CONFIG), str(tmp_path), str(tmp_path), plan)
+        command = smoke.matrix_system(ctx)[0].command("127.0.0.1", 9)
+        return float(command[command.index("--cpu-tier-gib") + 1])
+
+    assert cpu_tier("under-20h") == real_config()["matched"]["cpu_offload_gib"] == 32.0
+    assert cpu_tier("runpod-l4") == 24.0
+
+
 def test_a_matrix_off_the_native_path_is_refused(tmp_path):
     config = real_config()
     config["layover"]["transfer"] = "plain"
@@ -373,7 +383,7 @@ def test_refine_plan_asks_run_matrix_with_the_rates_and_leaves_a_line_for_the_sh
     calls = fake_pytest(monkeypatch, output)
     details = smoke.check_refine_plan(context(tmp_path))
     argv = calls[0]
-    assert argv[argv.index("--plan") + 1] == "first-pass" and "--dry-run" in argv
+    assert argv[argv.index("--plan") + 1] == "under-20h" and "--dry-run" in argv
     assert argv[argv.index("--measured-rates") + 1] == str(tmp_path / "measured_rates.json")
     assert details["low_hours"] == 12.5 and details["high_hours"] == 19.25
     written = (tmp_path / "refined_hours.txt").read_text().splitlines()
@@ -383,11 +393,11 @@ def test_refine_plan_asks_run_matrix_with_the_rates_and_leaves_a_line_for_the_sh
 
 def test_the_plan_to_price_comes_from_the_argument_then_the_environment_then_the_default(monkeypatch):
     monkeypatch.delenv("SMOKE_PLAN", raising=False)
-    assert smoke.parse_args([]).plan == "first-pass"
-    monkeypatch.setenv("SMOKE_PLAN", "")
-    assert smoke.parse_args([]).plan == "first-pass"
-    monkeypatch.setenv("SMOKE_PLAN", "under-20h")
     assert smoke.parse_args([]).plan == "under-20h"
+    monkeypatch.setenv("SMOKE_PLAN", "")
+    assert smoke.parse_args([]).plan == "under-20h"
+    monkeypatch.setenv("SMOKE_PLAN", "first-pass")
+    assert smoke.parse_args([]).plan == "first-pass"
     assert smoke.parse_args(["--plan", "three-loads-lean"]).plan == "three-loads-lean"
 
 

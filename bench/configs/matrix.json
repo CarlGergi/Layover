@@ -42,7 +42,7 @@
     {"name": "layover-discard", "kind": "layover", "policy": "discard"},
     {"name": "layover-discard-nocache", "kind": "layover", "policy": "discard", "prefix_cache": false, "label": "lower bound"}
   ],
-  "default_plan": "first-pass",
+  "default_plan": "under-20h",
   "plans": {
     "first-pass": {
       "description": "Headline systems at three loads x 5 runs, then each ablation at 100% load x 3 runs. Ordered so a budget stop keeps the most valuable cells.",
@@ -55,12 +55,13 @@
       ]
     },
     "under-20h": {
-      "description": "Headline systems at 100% load x 5 and 125% x 3, no 50%, then each ablation at 100% load x 3.",
+      "description": "Headline systems at 100% load x 5 and 125% x 3, then each ablation at 100% load x 3, then, only if the time budget remains, one 50% load run each for layover-combined and vllm as a low-load sanity check. Last in order, so a budget stop drops them first and the report lists them as not run.",
       "budget_hours": 20,
       "other_stages_hours": 3.5,
       "groups": [
         {"role": "headline", "systems": ["layover-combined", "vllm", "sglang"], "loads": [1.0, 1.25], "runs": {"load100": 5, "load125": 3}},
-        {"role": "headline", "systems": ["layover-discard", "layover-discard-nocache", "layover-combined-bf16", "layover-keep_ttl", "layover-swap"], "loads": [1.0], "runs": 3}
+        {"role": "headline", "systems": ["layover-discard", "layover-discard-nocache", "layover-combined-bf16", "layover-keep_ttl", "layover-swap"], "loads": [1.0], "runs": 3},
+        {"role": "headline", "systems": ["layover-combined", "vllm"], "loads": [0.5], "runs": 1}
       ]
     },
     "three-loads-lean": {
@@ -70,6 +71,17 @@
       "groups": [
         {"role": "headline", "systems": ["layover-combined", "vllm", "sglang"], "loads": [1.0], "runs": 3},
         {"role": "headline", "systems": ["layover-combined", "vllm", "sglang"], "loads": [1.25, 0.5], "runs": 3},
+        {"role": "headline", "systems": ["layover-discard", "layover-discard-nocache", "layover-combined-bf16", "layover-keep_ttl", "layover-swap"], "loads": [1.0], "runs": 2}
+      ]
+    },
+    "runpod-l4": {
+      "description": "For one rented L4 container with about 50 GB of RAM and about 15 GPU hours in all. The CPU tier is 24 GiB for every system, so the pinned memory fits beside the server. Layover and vLLM at 100% and 125% load x 3, then SGLang at the same points, then each ablation at 100% load x 2. Ordered so a budget stop keeps the most valuable cells.",
+      "matched": {"cpu_offload_gib": 24.0},
+      "budget_hours": 15,
+      "other_stages_hours": 1.5,
+      "groups": [
+        {"role": "headline", "systems": ["layover-combined", "vllm"], "loads": [1.0, 1.25], "runs": 3},
+        {"role": "headline", "systems": ["sglang"], "loads": [1.0, 1.25], "runs": 3},
         {"role": "headline", "systems": ["layover-discard", "layover-discard-nocache", "layover-combined-bf16", "layover-keep_ttl", "layover-swap"], "loads": [1.0], "runs": 2}
       ]
     },

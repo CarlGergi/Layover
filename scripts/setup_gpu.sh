@@ -7,6 +7,9 @@
 # Run it from a clone of this repository, as often as you like: what is already there is
 # kept. It uses non-interactive sudo for system packages it finds missing, it never installs
 # or changes the NVIDIA driver, and it needs no key or model account of any kind.
+#
+# LAYOVER_NO_DOCKER=1 leaves Docker alone, for a run without the traces stage, which is the only
+# one that runs containers. A rented container can then run every other stage.
 set -euo pipefail
 
 CHECK_ONLY=0
@@ -15,6 +18,7 @@ GPU_MODEL=${GPU_MODEL:-Qwen/Qwen3-4B}
 CPU_MODEL=${CPU_MODEL:-Qwen/Qwen3-0.6B}
 VENV=${VENV:-.venv}
 OS_RELEASE=${OS_RELEASE:-/etc/os-release}
+APT_DIR=${APT_DIR:-/etc/apt}
 
 # Table 2 of the CUDA 13.2 release notes: any 13.x runtime starts on a driver of at least 580.
 MIN_DRIVER_CUDA13=580
@@ -161,7 +165,11 @@ if [ "$CHECK_ONLY" = 1 ]; then
     exit 0
 fi
 
-ensure_docker
+if [ "${LAYOVER_NO_DOCKER:-}" = 1 ]; then
+    echo "Docker: left alone (LAYOVER_NO_DOCKER=1); only the traces stage needs it"
+else
+    ensure_docker
+fi
 
 MISSING=""
 for pair in curl:curl g++:g++ make:make tar:tar sha256sum:coreutils; do
@@ -183,7 +191,8 @@ if [ ! -x "$UV" ]; then
     curl -fsSL -o "$UV_DIR/uv.tar.gz" \
         "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-x86_64-unknown-linux-gnu.tar.gz"
     echo "$UV_SHA256  $UV_DIR/uv.tar.gz" | sha256sum -c --quiet - || die "uv download failed its checksum"
-    tar -xzf "$UV_DIR/uv.tar.gz" -C "$UV_DIR" --strip-components=1
+    # As root, tar keeps the archive's owners, which a network volume refuses to set.
+    tar --no-same-owner -xzf "$UV_DIR/uv.tar.gz" -C "$UV_DIR" --strip-components=1
 fi
 
 say "Creating the Python environment in $VENV"
@@ -227,7 +236,11 @@ if ! TOOLKIT_BIN=$(find_toolkit "$TORCH_CUDA"); then
     # sources.list entry and an apt pin. Paths are ubuntu2204 and ubuntu2404, and x86_64 is what
     # the keyring's own sources.list uses; the guide's amd64 path answers 404.
     repo="https://developer.download.nvidia.com/compute/cuda/repos/${ID:-ubuntu}${VERSION_ID//./}/x86_64"
-    if ! dpkg -s cuda-keyring >/dev/null 2>&1; then
+    # CUDA base images configure the repository with a key of their own, and a second entry for
+    # it with another key makes apt-get update fail.
+    if grep -qs "developer.download.nvidia.com/compute/cuda/repos" "$APT_DIR/sources.list" "$APT_DIR"/sources.list.d/*; then
+        echo "NVIDIA's repository is already configured"
+    elif ! dpkg -s cuda-keyring >/dev/null 2>&1; then
         keyring_dir=$(mktemp -d)
         curl -fsSL -o "$keyring_dir/cuda-keyring.deb" "$repo/cuda-keyring_1.1-1_all.deb" ||
             die "no NVIDIA repository at $repo. See https://docs.nvidia.com/cuda/cuda-installation-guide-linux/"

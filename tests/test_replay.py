@@ -204,3 +204,38 @@ def test_cli_generate_and_convert(tmp_path):
     converted = tmp_path / "c.jsonl"
     cli(["convert", str(path), "--out", str(converted)])
     assert load_jsonl(converted)[0].source == "mini-swe-agent-1"
+
+
+def test_replay_pauses_for_the_trace_s_stored_tool_durations_and_runs_nothing(micro_model, monkeypatch):
+    """Every system must see identical tool time: the frozen durations, never a live command."""
+    import subprocess
+    import sys
+
+    import layover.replay.http_replay as http_replay
+
+    def refuse(*args, **kwargs):
+        raise AssertionError(f"the replay tried to run a command: {args}")
+
+    monkeypatch.setattr(subprocess, "run", refuse)
+    monkeypatch.setattr(subprocess, "Popen", refuse)
+    slept = []
+    real_sleep = asyncio.sleep
+
+    async def record(seconds):
+        # The server's own event loop sleeps too; only the replay's pauses count here.
+        if sys._getframe(1).f_globals.get("__name__") == http_replay.__name__:
+            slept.append(seconds)
+            seconds = 0
+        await real_sleep(seconds)
+
+    monkeypatch.setattr(http_replay.asyncio, "sleep", record)
+    trace = TraceJob("j", 0.0, [TraceSession("j/m", [
+        TraceTurn(20, 3, "pip", 41.25), TraceTurn(10, 3, "pytest", 7.5), TraceTurn(5, 2, None, 99.0),
+    ])], "recorded:test")
+    served = Served(micro_model, ByteTokenizer(), "micro", blocks=512)
+    try:
+        asyncio.run(replay([trace], served.url, "micro", CFG.vocab_size, time_scale=2.0, system_tokens=32))
+    finally:
+        served.close()
+    # The arrival, then each pause scaled; the last turn's tool time is never waited on.
+    assert slept == [0.0, 41.25 * 2.0, 7.5 * 2.0]

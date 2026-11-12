@@ -24,7 +24,7 @@ endef
 .PHONY: traces
 .PHONY: test test-docker docker-image test-gpu gpu-smoke sanitize smoke \
 	traces-prepare baselines kv-crossover decode-bandwidth transfer-gather calibration \
-	matrix-dry-run matrix-preflight matrix matrix-report matrix-pipeline-check reproduce
+	matrix-dry-run matrix-preflight matrix matrix-report matrix-pipeline-check reproduce profile
 
 # Everything that runs without a GPU, on the micro model and real Qwen3-0.6B weights.
 test:
@@ -41,6 +41,16 @@ test-docker:
 # The GPU-only tests, on the target model.
 test-gpu:
 	$(PYTHON) -m pytest -q --gpu -m gpu --checkpoint $(GPU_MODEL)
+
+# Prefill and decode rates with an Nsight Systems capture and torch.profiler traces, then vLLM at
+# the same shapes for the target. About 40 minutes after setup on an L4.
+profile:
+	mkdir -p results/profile
+	LAYOVER_NVTX=1 nsys profile --trace=cuda,nvtx,osrt --force-overwrite=true -o results/profile/layover \
+		$(PYTHON) bench/profile_hot_path.py --quick --out results/profile/layover_nsys
+	$(PYTHON) bench/profile_hot_path.py --torch-trace --model $(GPU_MODEL) --out results/profile/layover
+	bash scripts/setup_baselines.sh vllm
+	.venvs/vllm/bin/python bench/profile_hot_path.py --system vllm --model $(GPU_MODEL) --out results/profile/vllm
 
 # Right after setup and before anything expensive: a broken machine costs minutes.
 gpu-smoke:

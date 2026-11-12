@@ -24,7 +24,7 @@ endef
 .PHONY: traces
 .PHONY: test test-docker docker-image test-gpu gpu-smoke sanitize smoke \
 	traces-prepare baselines kv-crossover decode-bandwidth transfer-gather calibration \
-	matrix-dry-run matrix-preflight matrix matrix-report matrix-pipeline-check reproduce profile
+	matrix-dry-run matrix-preflight matrix matrix-report matrix-pipeline-check reproduce profile figures
 
 # Everything that runs without a GPU, on the micro model and real Qwen3-0.6B weights.
 test:
@@ -51,6 +51,11 @@ profile:
 	$(PYTHON) bench/profile_hot_path.py --torch-trace --model $(GPU_MODEL) --out results/profile/layover
 	bash scripts/setup_baselines.sh vllm
 	.venvs/vllm/bin/python bench/profile_hot_path.py --system vllm --model $(GPU_MODEL) --out results/profile/vllm
+
+# The README's figures from the results here (RESULTS=dir for a session copied back), to docs/images.
+RESULTS ?= results
+figures:
+	$(PYTHON) bench/figures.py --results $(RESULTS) --out docs/images
 
 # Right after setup and before anything expensive: a broken machine costs minutes.
 gpu-smoke:

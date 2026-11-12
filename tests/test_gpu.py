@@ -75,11 +75,6 @@ def test_long_context_prefill_takes_a_fused_attention_kernel_on_cuda(monkeypatch
         torch.cuda.synchronize()
         assert int(torch.nn.attention.SDPBackend.MATH) not in choices, f"backends chosen: {choices}"
         assert torch.cuda.max_memory_allocated() - base < 3 * 2**30
-        # A first chunk attends to itself only, which FlashAttention takes with grouped queries.
-        first = BlockTable()
-        model.prefill(cache, first, torch.randint(0, 1024, (chunk,), device="cuda"), 0)
-        torch.cuda.synchronize()
-    assert choices[-1] == int(torch.nn.attention.SDPBackend.FLASH_ATTENTION), f"backends chosen: {choices}"
 
 
 def test_sanitize_shapes_launch_on_cuda():
@@ -159,3 +154,29 @@ def test_scheduler_swaps_through_the_native_path_on_real_weights(checkpoint, fp8
         assert cache.allocator.num_used == 0
     finally:
         backend.close()
+
+
+@pytest.mark.parametrize("start", [0, 16, 1000])
+def test_flash_prefill_matches_the_masked_path_with_no_mask_built(start):
+    """FlashAttention's bottom-right causal mask against SDPA with the explicit one, at Qwen3-4B's heads."""
+    from layover.model import PrefillChunk, prefill_attention
+
+    cfg = ModelConfig(vocab_size=64, hidden_size=256, intermediate_size=512, num_hidden_layers=1,
+                      num_attention_heads=32, num_key_value_heads=8, head_dim=128, max_position_embeddings=4096)
+    gen = torch.Generator("cuda").manual_seed(start)
+    tokens, end = 300, start + 300
+    cache = PagedKVCache(cfg, -(-end // 16), "cuda", torch.bfloat16)
+    table = BlockTable()
+    cache.prepare_write(table, 0, end)
+    history_k = torch.randn(8, end, 128, device="cuda", generator=gen, dtype=torch.bfloat16)
+    history_v = torch.randn(8, end, 128, device="cuda", generator=gen, dtype=torch.bfloat16)
+    cache.write_range(table, 0, 0, history_k, history_v)
+    q = torch.randn(32, tokens, 128, device="cuda", generator=gen, dtype=torch.bfloat16)
+    chunk = PrefillChunk(start, end, *cache.chunk_locations(table, start, tokens))
+    got = prefill_attention(q, history_k[:, start:], history_v[:, start:], cache, 0, chunk, 4)
+    allowed = torch.arange(end, device="cuda")[None] <= (start + torch.arange(tokens, device="cuda"))[:, None]
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.float(), history_k.float().repeat_interleave(4, 0), history_v.float().repeat_interleave(4, 0), attn_mask=allowed
+    )
+    assert chunk._masks == {}
+    assert (got.float() - expected).abs().max() < 2.0**-6

@@ -3245,3 +3245,14 @@ def test_the_dry_run_prices_every_plan_in_matrix_hours(capsys, qwen3_4b_config):
     for name, runs in (("first-pass", 60), ("under-20h", 41), ("three-loads-lean", 37), ("runpod-l4", 28), ("final", 8)):
         assert re.search(rf"  {name}: {runs} runs, [\d.]+ to [\d.]+ matrix hours\.", printed)
 
+
+
+def test_baselines_start_with_their_environment_first_on_path(monkeypatch):
+    """vLLM builds kernels at start-up with ninja from its own environment."""
+    monkeypatch.setenv("PATH", "/usr/bin")
+    for spec in run_matrix.system_specs(run_matrix.load_config(REPO / "bench/configs/matrix.json")):
+        system = build_system(spec, SETTINGS, TOKEN_BYTES)
+        if system.kind in ("vllm", "sglang"):
+            assert system.environment()["PATH"] == f"{Path(spec['venv']) / 'bin'}:/usr/bin"
+        elif system.kind == "layover":
+            assert "PATH" not in system.environment()

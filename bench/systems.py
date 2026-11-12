@@ -222,6 +222,12 @@ class System:
         return parse_prometheus(response.text)
 
 
+def _venv_path(venv: Path) -> dict[str, str]:
+    """The environment's bin first on PATH, as activating it would. vLLM builds kernels at start-up
+    with ninja from there; launched by full path without this, it failed on the L4."""
+    return {"PATH": f"{venv / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}"}
+
+
 class VllmSystem(System):
     kind = "vllm"
     # vLLM 0.33.0 exposes no tier capacity counter; this only proves the flag reached it.
@@ -254,6 +260,9 @@ class VllmSystem(System):
             "--disable-uvicorn-access-log",
             "--seed", str(s.seed),
         ]
+
+    def environment(self) -> dict[str, str]:
+        return _venv_path(self.venv)
 
     def installed_version(self) -> str | None:
         return _package_version(self.venv / "bin" / "python", "vllm")
@@ -316,6 +325,9 @@ class SglangSystem(System):
             "--enable-cache-report",
             "--random-seed", str(s.seed),
         ]
+
+    def environment(self) -> dict[str, str]:
+        return _venv_path(self.venv)
 
     def installed_version(self) -> str | None:
         return _package_version(self.venv / "bin" / "python", "sglang")

@@ -18,6 +18,9 @@
 #                           refined low estimate is already over that. --plan and --max-hours stay
 #                           with the session on a resume or a restore unless given again
 #   --continue-over-budget  go on past smoke even though its low estimate is over --max-hours
+#   --accept-saturation-edge
+#                           run the matrix at the edge of its calibration ladder when no rung brackets
+#                           the target slowdown; every output says so. Stays with the session
 #   --stop-after-smoke      stop after smoke, to read its refined hours before paying for the rest;
 #                           the same command without this flag goes on from there
 #   --detach                start the run and return; nothing here needs to stay awake. Come back
@@ -128,16 +131,17 @@ setting() { sed -n "s/^$1 //p" "$STATE/settings" 2>/dev/null; }
 matrix_args() {
     local args=""
     [ -z "$1" ] || args="--plan $(printf '%q' "$1") "
-    [ -z "$2" ] || args="$args--max-hours $(printf '%q' "$2")"
+    [ -z "$2" ] || args="$args--max-hours $(printf '%q' "$2") "
+    [ "${3:-0}" != 1 ] || args="$args--accept-saturation-edge"
     printf '%s' "${args% }"
 }
 
 export_stage_settings() {
-    local plan max
-    plan=$(setting plan) max=$(setting max_hours)
+    local plan max edge
+    plan=$(setting plan) max=$(setting max_hours) edge=$(setting accept_saturation_edge)
     # Unset rather than empty: make's ?= takes an empty variable as already set.
     unset MATRIX_ARGS TRACES_ARGS SMOKE_PLAN
-    [ -z "$plan$max" ] || export MATRIX_ARGS="$(matrix_args "$plan" "$max")"
+    [ -z "$plan$max" ] && [ "$edge" != 1 ] || export MATRIX_ARGS="$(matrix_args "$plan" "$max" "$edge")"
     [ -z "$plan" ] || export SMOKE_PLAN="$plan"
     [ "$(setting allow_iam_role)" != 1 ] || export TRACES_ARGS=--allow-iam-role
 }
@@ -484,7 +488,7 @@ stage_exit_code() {
 }
 
 HOST="" PORT="" KEY="" ONLY_STAGE="" FROM_STAGE="" STAGE_LIST="" HOURLY_USD="" EXTRA_SSH=""
-DRY_RUN=0 STATUS=0 FETCH_ONLY=0 KEEP_GOING=0 SECRET_SCAN=1 PLAN_NAME="" MAX_HOURS="" SAVED_PLAN="" CONTINUE_OVER_BUDGET=0
+DRY_RUN=0 STATUS=0 FETCH_ONLY=0 KEEP_GOING=0 SECRET_SCAN=1 PLAN_NAME="" MAX_HOURS="" SAVED_PLAN="" CONTINUE_OVER_BUDGET=0 ACCEPT_EDGE=0
 REMOTE_DIR=layover-run FETCH_EVERY=600 FETCH_EVERY_RUNS=60 POLL=5 RECONNECT_TIMEOUT=1800 MIN_DISK_GB=200 MIN_GPU_MIB=22000 MIN_RAM_GB=64 ALLOW_IAM_ROLE=0
 STOP_AFTER_SMOKE=0 RESTORE_FROM="" SPOT_NOTICE=0 RESUME_FLAGS=""
 DETACH=0 AUTO_SHUTDOWN=1 MAX_SESSION_HOURS="" LEAVE_RUNNING=0 RUNNER_STARTED=0 PROVIDER="" REMOTE_DIR_GIVEN=0
@@ -512,6 +516,7 @@ while [ $# -gt 0 ]; do
         --plan) need_value "$1" $#; plan_ok "$2" || usage_error "--plan needs a plain name, got '$2'"; PLAN_NAME=$2; shift 2 ;;
         --max-hours) need_value "$1" $#; need_number "$1" "$2"; MAX_HOURS=$2; shift 2 ;;
         --continue-over-budget) CONTINUE_OVER_BUDGET=1; shift ;;
+        --accept-saturation-edge) ACCEPT_EDGE=1; shift ;;
         --stop-after-smoke) STOP_AFTER_SMOKE=1; shift ;;
         --detach) DETACH=1; shift ;;
         --no-auto-shutdown) AUTO_SHUTDOWN=0; shift ;;
@@ -675,6 +680,8 @@ merge_settings() {
                 number_ok "$value" || fail 1 "the session's saved --max-hours is not a number: $value"
                 [ -n "$MAX_HOURS" ] || MAX_HOURS=$value
                 ;;
+            # A matrix already run at the edge must go on at it, or its runs would mix two loads.
+            accept_saturation_edge) [ "$value" != 1 ] || ACCEPT_EDGE=1 ;;
         esac
     done <<EOF
 $1
@@ -695,6 +702,7 @@ settings_text() {
     [ -z "$MAX_HOURS" ] || echo "max_hours $MAX_HOURS"
     [ "$ALLOW_IAM_ROLE" = 0 ] || echo "allow_iam_role 1"
     [ "$CONTINUE_OVER_BUDGET" = 0 ] || echo "continue_over_budget 1"
+    [ "$ACCEPT_EDGE" = 0 ] || echo "accept_saturation_edge 1"
     echo "auto_shutdown $AUTO_SHUTDOWN"
     echo "deadman_hours $(deadman_hours)"
     [ -z "$PROVIDER" ] || echo "provider $PROVIDER"
@@ -729,7 +737,7 @@ if [ "$DRY_RUN" = 1 ]; then
         for stage in $PLAN; do
             printf '%-11s detached on the machine: %s\n' "$stage" "$(stage_command "$stage")"
         done
-        echo "stage env   MATRIX_ARGS=[$(matrix_args "$PLAN_NAME" "$MAX_HOURS")] SMOKE_PLAN=[$PLAN_NAME] TRACES_ARGS=[$([ "$ALLOW_IAM_ROLE" = 0 ] || echo --allow-iam-role)]"
+        echo "stage env   MATRIX_ARGS=[$(matrix_args "$PLAN_NAME" "$MAX_HOURS" "$ACCEPT_EDGE")] SMOKE_PLAN=[$PLAN_NAME] TRACES_ARGS=[$([ "$ALLOW_IAM_ROLE" = 0 ] || echo --allow-iam-role)]"
         if [ -n "$MAX_HOURS" ] && [ "$CONTINUE_OVER_BUDGET" = 0 ]; then
             echo "budget      stops after smoke if its low estimate is over $MAX_HOURS hours"
         fi

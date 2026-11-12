@@ -2951,3 +2951,14 @@ def test_a_root_login_without_rsync_gets_it_installed(world, tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "rsync: missing; installing it" in result.stdout
     assert "install -y --no-install-recommends rsync" in (world.home / "apt.log").read_text()
+
+
+def test_the_saturation_edge_reaches_the_matrix_and_stays_with_the_session(world):
+    assert world.run("--plan", "final", "--max-hours", "9.5", "--accept-saturation-edge", "--stages", "reproduce").returncode == 0
+    assert stage_env(world, "reproduce")["MATRIX_ARGS"] == "--plan final --max-hours 9.5 --accept-saturation-edge"
+    assert "accept_saturation_edge 1" in (world.state / "settings").read_text()
+    # A later command on the session keeps it, so the matrix never mixes two loads.
+    (world.home / "stage_env.log").unlink()
+    assert world.run("--stage", "reproduce").returncode == 0
+    assert stage_env(world, "reproduce")["MATRIX_ARGS"] == "--plan final --max-hours 9.5 --accept-saturation-edge"
+    assert "--accept-saturation-edge" in world.run("--accept-saturation-edge", "--dry-run").stdout

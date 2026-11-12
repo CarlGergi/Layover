@@ -382,6 +382,26 @@ def test_engine_greedy_tokens_match_torch_backend_fp32():
 
 
 @interpreted
+def test_engine_greedy_tokens_match_with_the_trusted_kernel():
+    """The path the server takes: the model checks each step on the host, the kernel nothing."""
+    prompts = greedy_prompts()
+    for dtype in (torch.float32, torch.bfloat16):
+        assert greedy(td.paged_decode_attention_triton_trusted, dtype, prompts) == greedy(reference, dtype, prompts)
+
+
+def test_the_trusted_kernel_reads_nothing_back_and_matches_the_checked_one(monkeypatch):
+    q, pool, table, lens, groups = make_case([5, 33, 16], 2, 4, 16, 16, 2, torch.float32, 3, 1.0)
+    checked = kernel(q, pool, 1, table, lens, groups)
+    reads = []
+    real = torch.Tensor.tolist
+    monkeypatch.setattr(torch.Tensor, "tolist", lambda self: (reads.append(1), real(self))[1])
+    trusted = td.paged_decode_attention_triton_trusted(q, pool, 1, table, lens, groups)
+    assert reads == [] and torch.equal(trusted, checked)
+    # What the host does not know still stops it.
+    with pytest.raises(ValueError, match="layer"):
+        td.paged_decode_attention_triton_trusted(q, pool, 9, table, lens, groups)
+
+
 def test_engine_greedy_tokens_match_torch_backend_bf16():
     prompts = greedy_prompts()
     assert greedy(kernel, torch.bfloat16, prompts) == greedy(reference, torch.bfloat16, prompts)

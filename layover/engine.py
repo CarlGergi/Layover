@@ -18,6 +18,7 @@ import torch
 
 from layover.kv.paged_cache import BlockTable, PagedKVCache
 from layover.model import Qwen3
+from layover.profiling import nvtx_range
 
 
 class State(Enum):
@@ -135,8 +136,9 @@ class Engine:
         request.admitted_at = self.clock()
         self.running.append(request)
 
-    def _emit(self, request: Request, logits: torch.Tensor) -> None:
-        token = int(logits.argmax(-1))
+    def _emit(self, request: Request, logits: torch.Tensor, token: int | None = None) -> None:
+        """Append the greedy token. A batch passes the tokens it read back in one go."""
+        token = int(logits.argmax(-1)) if token is None else token
         request.last_logits = logits
         request.generated.append(token)
         if request.first_token_at is None:
@@ -181,8 +183,9 @@ class Engine:
         batch = batch[: self.config.max_batch]
         tokens = torch.tensor([r.generated[-1] for r in batch], device=self.cache.device)
         logits = self.model.decode(self.cache, [r.table for r in batch], tokens)
-        for request, row in zip(batch, logits):
-            self._emit(request, row)
+        # One read back for the whole batch, not one per request.
+        for request, row, token in zip(batch, logits, logits.argmax(-1).tolist()):
+            self._emit(request, row, token)
         return True
 
     def _retire(self) -> bool:
@@ -211,12 +214,15 @@ class Engine:
 
     def step(self) -> bool:
         """Advance every runnable request once. Returns whether anything happened."""
-        transferred = self._poll_transfers()
-        self._admit()
-        prefilled = self._prefill()
-        decoded = self._decode()
-        retired = self._retire()
-        return transferred or prefilled or decoded or retired
+        with nvtx_range("step"):
+            transferred = self._poll_transfers()
+            self._admit()
+            with nvtx_range("step.prefill"):
+                prefilled = self._prefill()
+            with nvtx_range("step.decode"):
+                decoded = self._decode()
+            retired = self._retire()
+            return transferred or prefilled or decoded or retired
 
     def run_until_idle(self, max_steps: int = 1_000_000) -> list[Request]:
         for _ in range(max_steps):

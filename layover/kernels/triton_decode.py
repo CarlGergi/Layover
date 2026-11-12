@@ -179,12 +179,8 @@ def run_kernel(q, pool, layer, block_table, lengths, kv_groups, out) -> None:
     _paged_decode_kernel[grid](*args, **options)
 
 
-def validate(q, pool, layer, block_table, lengths, kv_groups) -> None:
-    """Refuse what would otherwise be an out-of-bounds read on the GPU.
-
-    A bad block id in a kernel does not raise: it returns garbage or takes the device
-    down, so it is cheaper to spend two small launches and one read per call checking here.
-    """
+def validate_shapes(q, pool, layer, block_table, lengths, kv_groups) -> None:
+    """Everything validate checks that the host already knows: ranks, dtypes, devices, layer."""
     if triton is None:
         raise RuntimeError("the Triton decode kernel needs triton, which has Linux wheels only")
     if q.dim() != 3 or pool.dim() != 6 or block_table.dim() != 2 or lengths.dim() != 1:
@@ -217,7 +213,17 @@ def validate(q, pool, layer, block_table, lengths, kv_groups) -> None:
             raise ValueError(f"tensors are on {q.device}, the current device is {torch.cuda.current_device()}")
     if block_table.is_floating_point() or lengths.is_floating_point():
         raise TypeError("the block table and lengths must be integers")
-    # One read for all four: this runs per layer per step, and each read waits for the GPU.
+
+
+def validate(q, pool, layer, block_table, lengths, kv_groups) -> None:
+    """Refuse what would otherwise be an out-of-bounds read on the GPU.
+
+    A bad block id in a kernel does not raise: it returns garbage or takes the device
+    down, so it is cheaper to spend two small launches and one read per call checking here.
+    """
+    validate_shapes(q, pool, layer, block_table, lengths, kv_groups)
+    slots, blocks = pool.shape[4], pool.shape[0]
+    # One read for all four, which waits for the GPU: the decode loop uses the trusted path instead.
     bounds = torch.stack([*torch.aminmax(lengths.long()), *torch.aminmax(block_table.long())])
     shortest, longest, lowest, highest = bounds.tolist()
     if shortest < 1 or longest > block_table.shape[1] * slots:
@@ -236,6 +242,26 @@ def paged_decode_attention_triton(
 ) -> torch.Tensor:
     """Drop-in for paged_decode_attention_torch; the result has q's dtype and device."""
     validate(q, pool, layer, block_table, lengths, kv_groups)
+    return _launch(q, pool, layer, block_table, lengths, kv_groups)
+
+
+def paged_decode_attention_triton_trusted(
+    q: torch.Tensor,
+    pool: torch.Tensor,
+    layer: int,
+    block_table: torch.Tensor,
+    lengths: torch.Tensor,
+    kv_groups: int,
+) -> torch.Tensor:
+    """paged_decode_attention_triton for a table whose lengths and block ids the caller checked
+    on the host, as PagedKVCache.decode_batch does once per step. It reads nothing back from the
+    GPU, so a step's layers queue without waiting on one another; validate's read did that on
+    every layer of every step."""
+    validate_shapes(q, pool, layer, block_table, lengths, kv_groups)
+    return _launch(q, pool, layer, block_table, lengths, kv_groups)
+
+
+def _launch(q, pool, layer, block_table, lengths, kv_groups) -> torch.Tensor:
     q = q.contiguous()
     block_table, lengths = block_table.contiguous(), lengths.contiguous()
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)

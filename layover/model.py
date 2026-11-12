@@ -2,9 +2,15 @@
 
 Parameter names match the Hugging Face checkpoint so weights load without renaming.
 Linear layers run on torch.matmul, which is cuBLAS on CUDA.
+
+What a step's layers share is built once per step, not per layer: a prefill chunk's block ids
+and write positions, a decode batch's block table and lengths. Each is one copy to the device,
+and the layers read nothing back from it, so the host can queue a whole step ahead of the GPU.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
@@ -12,7 +18,8 @@ import torch.nn.functional as F
 
 from layover.config import ModelConfig
 from layover.kernels.decode_attention import paged_decode_attention_torch
-from layover.kv.paged_cache import BlockTable, PagedKVCache
+from layover.kv.paged_cache import BlockTable, DecodeBatch, PagedKVCache
+from layover.profiling import nvtx_range
 
 
 class RMSNorm(nn.Module):
@@ -27,6 +34,54 @@ class RMSNorm(nn.Module):
         wide = x.float()
         scaled = wide * torch.rsqrt(wide.pow(2).mean(-1, keepdim=True) + self.eps)
         return self.weight * scaled.to(x.dtype)
+
+
+@dataclass
+class PrefillChunk:
+    """Tokens [start, end) of one sequence, as every layer of the chunk sees them."""
+
+    start: int
+    end: int
+    block_ids: torch.Tensor
+    write_blocks: torch.Tensor
+    write_slots: torch.Tensor
+    _masks: dict = field(default_factory=dict)
+
+    @property
+    def tokens(self) -> int:
+        return self.end - self.start
+
+    def folded_mask(self, groups: int) -> torch.Tensor:
+        """[groups * tokens, end]: query row g * tokens + t sees keys up to start + t. Built once
+        per chunk; the layers share it."""
+        if groups not in self._masks:
+            device = self.block_ids.device
+            allowed = torch.arange(self.end, device=device)[None] <= (self.start + torch.arange(self.tokens, device=device))[:, None]
+            self._masks[groups] = allowed.repeat(groups, 1)
+        return self._masks[groups]
+
+
+def prefill_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cache: PagedKVCache, layer: int, chunk: PrefillChunk, groups: int) -> torch.Tensor:
+    """Attention for one prefill chunk. q is [heads, tokens, dim]; k and v are the chunk's own,
+    [kv_heads, tokens, dim], already written to the cache. Returns [heads, tokens, dim].
+
+    Neither path expands K and V to the query heads. The first chunk attends only to itself, so
+    it is plain causal attention with grouped queries, which FlashAttention takes as is. A later
+    chunk also attends to everything before it, which needs a mask that SDPA's causal flag
+    cannot express. Folding the query heads that share a KV head into the sequence makes that
+    ordinary multi-head attention over the unexpanded K and V, which the fused kernels take with
+    a mask. The history itself is still gathered from the pool once per layer; reading it in
+    place needs a paged prefill kernel.
+    """
+    # Through the cache's dtype and back, as a later chunk and decode see these values.
+    k, v = k.to(cache.dtype).to(q.dtype), v.to(cache.dtype).to(q.dtype)
+    if chunk.start == 0:
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=groups > 1)
+    all_k, all_v = cache.read_blocks(chunk.block_ids, layer, chunk.end)
+    kv_heads, dim = all_k.shape[0], q.shape[-1]
+    folded = q.reshape(kv_heads, groups * chunk.tokens, dim)
+    out = F.scaled_dot_product_attention(folded, all_k.to(q.dtype), all_v.to(q.dtype), attn_mask=chunk.folded_mask(groups))
+    return out.reshape(kv_heads * groups, chunk.tokens, dim)
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -60,33 +115,18 @@ class Attention(nn.Module):
         k = k * cos + rotate_half(k) * sin
         return q, k, v
 
-    def forward_prefill(self, x, cos, sin, cache: PagedKVCache, table: BlockTable, start: int):
+    def forward_prefill(self, x, cos, sin, cache: PagedKVCache, chunk: PrefillChunk):
         q, k, v = self.project(x, cos, sin)
-        tokens = x.shape[1]
-        cache.write_range(table, self.layer, start, k[0], v[0])
-        end = start + tokens
-        all_k, all_v = cache.read_range(table, self.layer, end)
-        groups = self.cfg.kv_groups
-        # Causal within the chunk, everything before the chunk is visible.
-        allowed = torch.arange(end, device=x.device)[None] <= (start + torch.arange(tokens, device=x.device))[:, None]
-        out = F.scaled_dot_product_attention(
-            q[0],
-            all_k.repeat_interleave(groups, dim=0).to(q.dtype),
-            all_v.repeat_interleave(groups, dim=0).to(q.dtype),
-            attn_mask=allowed,
-        )
-        return self.o_proj(out.transpose(0, 1).reshape(1, tokens, -1))
+        cache.write_at(chunk.write_blocks, chunk.write_slots, self.layer, k[0], v[0])
+        out = prefill_attention(q[0], k[0], v[0], cache, self.layer, chunk, self.cfg.kv_groups)
+        return self.o_proj(out.transpose(0, 1).reshape(1, chunk.tokens, -1))
 
-    def forward_decode(self, x, cos, sin, cache: PagedKVCache, tables: list[BlockTable], positions, attend):
+    def forward_decode(self, x, cos, sin, cache: PagedKVCache, batch: DecodeBatch, attend):
         q, k, v = self.project(x, cos, sin)
-        batch = x.shape[0]
-        blocks = torch.tensor([t.blocks[p // cache.block_tokens] for t, p in zip(tables, positions)], device=x.device)
-        slots = torch.tensor([p % cache.block_tokens for p in positions], device=x.device)
-        cache.pool[blocks, 0, self.layer, :, slots] = k[:, :, 0].to(cache.dtype)
-        cache.pool[blocks, 1, self.layer, :, slots] = v[:, :, 0].to(cache.dtype)
-        table, lengths = cache.block_table_tensor(tables)
-        out = attend(q[:, :, 0], cache.pool, self.layer, table, lengths, self.cfg.kv_groups)
-        return self.o_proj(out.reshape(batch, 1, -1).to(x.dtype))
+        cache.pool[batch.write_blocks, 0, self.layer, :, batch.write_slots] = k[:, :, 0].to(cache.dtype)
+        cache.pool[batch.write_blocks, 1, self.layer, :, batch.write_slots] = v[:, :, 0].to(cache.dtype)
+        out = attend(q[:, :, 0], cache.pool, self.layer, batch.table, batch.lengths, self.cfg.kv_groups)
+        return self.o_proj(out.reshape(x.shape[0], 1, -1).to(x.dtype))
 
 
 class MLP(nn.Module):
@@ -132,6 +172,8 @@ class Qwen3(nn.Module):
         freqs = 1.0 / (cfg.rope_theta ** (torch.arange(0, cfg.head_dim, 2, dtype=torch.float32) / cfg.head_dim))
         self.register_buffer("inv_freq", freqs, persistent=False)
         self.decode_attention = paged_decode_attention_torch
+        # Names made once, since a range is opened per layer per step.
+        self._range_names = [(f"layer{i}.attention", f"layer{i}.mlp") for i in range(cfg.num_hidden_layers)]
 
     def rope(self, positions: torch.Tensor, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
         """cos and sin shaped [batch, 1, tokens, head_dim] for broadcasting over heads."""
@@ -156,29 +198,35 @@ class Qwen3(nn.Module):
         layer_outputs, when given, collects each decoder layer's output for parity tests.
         """
         count = tokens.shape[0]
-        cache.prepare_write(table, start, start + count)
-        x = self.model.embed_tokens(tokens)[None]
-        positions = torch.arange(start, start + count, device=tokens.device)[None]
-        cos, sin = self.rope(positions, x.dtype)
-        for layer in self.model.layers:
-            attended = layer.self_attn.forward_prefill(layer.input_layernorm(x), cos, sin, cache, table, start)
-            x = layer.finish(x, attended)
-            if layer_outputs is not None:
-                layer_outputs.append(x[0].clone())
-        x = self.model.norm(x)
-        return self.lm_head(x[0] if all_logits else x[0, -1])
+        with nvtx_range("prefill"):
+            cache.prepare_write(table, start, start + count)
+            chunk = PrefillChunk(start, start + count, *cache.chunk_locations(table, start, count))
+            x = self.model.embed_tokens(tokens)[None]
+            positions = torch.arange(start, start + count, device=tokens.device)[None]
+            cos, sin = self.rope(positions, x.dtype)
+            for layer, (attention_name, mlp_name) in zip(self.model.layers, self._range_names):
+                with nvtx_range(attention_name):
+                    attended = layer.self_attn.forward_prefill(layer.input_layernorm(x), cos, sin, cache, chunk)
+                with nvtx_range(mlp_name):
+                    x = layer.finish(x, attended)
+                if layer_outputs is not None:
+                    layer_outputs.append(x[0].clone())
+            x = self.model.norm(x)
+            return self.lm_head(x[0] if all_logits else x[0, -1])
 
     @torch.inference_mode()
     def decode(self, cache: PagedKVCache, tables: list[BlockTable], tokens: torch.Tensor) -> torch.Tensor:
         """Run one token for each table, appending it; returns logits [batch, vocab]."""
-        positions = [t.num_tokens for t in tables]
-        for table, position in zip(tables, positions):
-            cache.prepare_write(table, position, position + 1)
-        x = self.model.embed_tokens(tokens)[:, None]
-        cos, sin = self.rope(torch.tensor(positions, device=tokens.device)[:, None], x.dtype)
-        for layer in self.model.layers:
-            attended = layer.self_attn.forward_decode(
-                layer.input_layernorm(x), cos, sin, cache, tables, positions, self.decode_attention
-            )
-            x = layer.finish(x, attended)
-        return self.lm_head(self.model.norm(x)[:, 0])
+        with nvtx_range("decode"):
+            for table in tables:
+                cache.prepare_write(table, table.num_tokens, table.num_tokens + 1)
+            batch = cache.decode_batch(tables)
+            x = self.model.embed_tokens(tokens)[:, None]
+            # The position of each new token is its length less one.
+            cos, sin = self.rope((batch.lengths.long() - 1)[:, None], x.dtype)
+            for layer, (attention_name, mlp_name) in zip(self.model.layers, self._range_names):
+                with nvtx_range(attention_name):
+                    attended = layer.self_attn.forward_decode(layer.input_layernorm(x), cos, sin, cache, batch, self.decode_attention)
+                with nvtx_range(mlp_name):
+                    x = layer.finish(x, attended)
+            return self.lm_head(self.model.norm(x)[:, 0])

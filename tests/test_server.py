@@ -330,10 +330,10 @@ def test_server_defaults_use_the_torch_reference_and_plain_copies(monkeypatch, t
 
 def test_triton_flag_selects_the_kernel(monkeypatch, tmp_path):
     pytest.importorskip("triton")
-    from layover.kernels.triton_decode import paged_decode_attention_triton
+    from layover.kernels.triton_decode import paged_decode_attention_triton_trusted
 
     scheduler = run_main_until_scheduler(monkeypatch, tmp_path, ["--decode-backend", "triton"])
-    assert scheduler.model.decode_attention is paged_decode_attention_triton
+    assert scheduler.model.decode_attention is paged_decode_attention_triton_trusted
 
 
 def test_offload_dtype_flag_reaches_the_tier(monkeypatch, tmp_path):

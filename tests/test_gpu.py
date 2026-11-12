@@ -60,18 +60,26 @@ def test_long_context_prefill_takes_a_fused_attention_kernel_on_cuda(monkeypatch
     choices = []
     real = torch.nn.functional.scaled_dot_product_attention
 
-    def spy(q, k, v, attn_mask=None):
-        choices.append(torch._fused_sdp_choice(q, k, v, attn_mask=attn_mask))
-        return real(q, k, v, attn_mask=attn_mask)
+    def spy(q, k, v, attn_mask=None, is_causal=False, enable_gqa=False):
+        choices.append(torch._fused_sdp_choice(q, k, v, attn_mask=attn_mask, is_causal=is_causal, enable_gqa=enable_gqa))
+        return real(q, k, v, attn_mask=attn_mask, is_causal=is_causal, enable_gqa=enable_gqa)
 
     monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", spy)
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
-    model.prefill(cache, table, torch.randint(0, 1024, (chunk,), device="cuda"), context - chunk)
-    torch.cuda.synchronize()
-    assert int(torch.nn.attention.SDPBackend.MATH) not in choices, f"backends chosen: {choices}"
-    assert torch.cuda.max_memory_allocated() - base < 3 * 2**30
+    fused = [torch.nn.attention.SDPBackend.FLASH_ATTENTION, torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION]
+    # With the math path ruled out, a call no fused kernel takes raises here.
+    with torch.nn.attention.sdpa_kernel(fused):
+        model.prefill(cache, table, torch.randint(0, 1024, (chunk,), device="cuda"), context - chunk)
+        torch.cuda.synchronize()
+        assert int(torch.nn.attention.SDPBackend.MATH) not in choices, f"backends chosen: {choices}"
+        assert torch.cuda.max_memory_allocated() - base < 3 * 2**30
+        # A first chunk attends to itself only, which FlashAttention takes with grouped queries.
+        first = BlockTable()
+        model.prefill(cache, first, torch.randint(0, 1024, (chunk,), device="cuda"), 0)
+        torch.cuda.synchronize()
+    assert choices[-1] == int(torch.nn.attention.SDPBackend.FLASH_ATTENTION), f"backends chosen: {choices}"
 
 
 def test_sanitize_shapes_launch_on_cuda():

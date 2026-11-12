@@ -68,9 +68,11 @@ def test_prefill_attention_is_eligible_for_a_fused_kernel(monkeypatch):
     calls = []
     real = torch.nn.functional.scaled_dot_product_attention
 
-    def spy(q, k, v, attn_mask=None):
-        calls.append(torch._fused_sdp_choice(q, k, v, attn_mask=attn_mask))
-        return real(q, k, v, attn_mask=attn_mask)
+    def spy(q, k, v, attn_mask=None, is_causal=False, enable_gqa=False):
+        calls.append(torch._fused_sdp_choice(q, k, v, attn_mask=attn_mask, is_causal=is_causal, enable_gqa=enable_gqa))
+        # Neither path expands K and V to the query heads.
+        assert k.shape[-3] == CFG.num_key_value_heads
+        return real(q, k, v, attn_mask=attn_mask, is_causal=is_causal, enable_gqa=enable_gqa)
 
     monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", spy)
     torch.manual_seed(0)

@@ -284,9 +284,10 @@ def check_decode_rates(ctx: Context) -> dict:
     matched = ctx.matrix()["matched"]
     context, batch_sizes, chunk = (8192, (1, matched["max_running"]), matched["prefill_chunk"]) if ctx.on_gpu else (64, (1, 4), 64)
     if ctx.on_gpu:
-        from layover.kernels.triton_decode import paged_decode_attention_triton
+        from layover.kernels.triton_decode import paged_decode_attention_triton_trusted
 
-        model.decode_attention = paged_decode_attention_triton
+        # As the server runs it: the model checks each step's tables on the host.
+        model.decode_attention = paged_decode_attention_triton_trusted
     cache = PagedKVCache(cfg, context // 16 + max(batch_sizes) + 8, ctx.device, bf16())
     steps, gen = {}, torch.Generator().manual_seed(0)
     with torch.inference_mode():

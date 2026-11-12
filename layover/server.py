@@ -438,9 +438,9 @@ def main(argv=None) -> None:
     root = str(resolve_checkpoint(args.model))
     model = load_model(root, device=args.device, dtype=dtype)
     if args.decode_backend == "triton":
-        from layover.kernels.triton_decode import paged_decode_attention_triton
+        from layover.kernels.triton_decode import paged_decode_attention_triton_trusted
 
-        model.decode_attention = paged_decode_attention_triton
+        model.decode_attention = paged_decode_attention_triton_trusted
     token_bytes = model.cfg.kv_bytes_per_token(args.dtype)
     block_bytes = token_bytes * args.block_tokens
     cache = PagedKVCache(model.cfg, int(args.pool_gib * 2**30 / block_bytes), args.device, dtype, args.block_tokens)

@@ -100,33 +100,79 @@ class PagedKVCache:
         table.blocks = []
         table.num_tokens = 0
 
-    def _locate(self, table: BlockTable, start: int, count: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _to_device(self, host: torch.Tensor) -> torch.Tensor:
+        """One copy to the device. From pinned memory it is queued behind the work already
+        launched instead of waiting for it, which a copy from pageable memory does."""
+        if self.device.type != "cuda":
+            return host.to(self.device)
+        return host.pin_memory().to(self.device, non_blocking=True)
+
+    def chunk_locations(self, table: BlockTable, start: int, count: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """For tokens [start, start + count): the ids of every block they and the tokens before
+        them occupy, then each token's block and slot. One copy to the device, which every
+        layer of a prefill chunk shares."""
+        ids = self._to_device(torch.tensor(table.blocks[: self.blocks_for(start + count)], dtype=torch.long))
         positions = torch.arange(start, start + count, device=self.device)
-        ids = torch.tensor(table.blocks, device=self.device, dtype=torch.long)
-        return ids[positions // self.block_tokens], positions % self.block_tokens
+        return ids, ids[positions // self.block_tokens], positions % self.block_tokens
+
+    def write_at(self, blocks: torch.Tensor, slots: torch.Tensor, layer: int, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Store k and v of shape [kv_heads, count, head_dim] at the given blocks and slots."""
+        # Advanced indices around a slice put the index dimension first.
+        self.pool[blocks, KEY, layer, :, slots] = k.transpose(0, 1).to(self.dtype)
+        self.pool[blocks, VALUE, layer, :, slots] = v.transpose(0, 1).to(self.dtype)
+
+    def read_blocks(self, ids: torch.Tensor, layer: int, end: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """K and V of the first `end` tokens held in blocks `ids`, as [kv_heads, end, head_dim]."""
+        k = self.pool[ids, KEY, layer].permute(1, 0, 2, 3).flatten(1, 2)[:, :end]
+        v = self.pool[ids, VALUE, layer].permute(1, 0, 2, 3).flatten(1, 2)[:, :end]
+        return k, v
 
     def write_range(self, table: BlockTable, layer: int, start: int, k: torch.Tensor, v: torch.Tensor) -> None:
         """Store k and v of shape [kv_heads, count, head_dim] at token `start`.
 
         The table must have been prepared with prepare_write.
         """
-        blocks, slots = self._locate(table, start, k.shape[1])
-        # Advanced indices around a slice put the index dimension first.
-        self.pool[blocks, KEY, layer, :, slots] = k.transpose(0, 1).to(self.dtype)
-        self.pool[blocks, VALUE, layer, :, slots] = v.transpose(0, 1).to(self.dtype)
+        _, blocks, slots = self.chunk_locations(table, start, k.shape[1])
+        self.write_at(blocks, slots, layer, k, v)
 
     def read_range(self, table: BlockTable, layer: int, end: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Return K and V of the first `end` tokens as [kv_heads, end, head_dim]."""
-        ids = torch.tensor(table.blocks[: self.blocks_for(end)], device=self.device, dtype=torch.long)
-        k = self.pool[ids, KEY, layer].permute(1, 0, 2, 3).flatten(1, 2)[:, :end]
-        v = self.pool[ids, VALUE, layer].permute(1, 0, 2, 3).flatten(1, 2)[:, :end]
-        return k, v
+        ids = self._to_device(torch.tensor(table.blocks[: self.blocks_for(end)], dtype=torch.long))
+        return self.read_blocks(ids, layer, end)
+
+    def decode_batch(self, tables: list[BlockTable]) -> "DecodeBatch":
+        """Everything one decode step's layers need about its tables, checked on the host and
+        copied to the device once.
+
+        Each table must already hold the token being written, as prepare_write leaves it. The
+        checks are the ones a kernel cannot make for itself, since a bad block id there reads
+        another sequence's memory or takes the device down; here they cost no GPU read.
+        """
+        width = max(len(t.blocks) for t in tables)
+        rows = []
+        for t in tables:
+            if not 1 <= t.num_tokens <= len(t.blocks) * self.block_tokens:
+                raise ValueError(f"a table of {len(t.blocks)} blocks cannot hold {t.num_tokens} tokens")
+            if t.blocks and not 0 <= min(t.blocks) <= max(t.blocks) < self.allocator.num_blocks:
+                raise ValueError(f"block ids {t.blocks} are outside a pool of {self.allocator.num_blocks} blocks")
+            last = t.num_tokens - 1
+            # Padding repeats block 0, a real block, and the kernel never reads past a length.
+            rows.append([t.blocks[last // self.block_tokens], last % self.block_tokens, t.num_tokens, *t.blocks, *[0] * (width - len(t.blocks))])
+        packed = self._to_device(torch.tensor(rows, dtype=torch.int32))
+        return DecodeBatch(packed[:, 0].long(), packed[:, 1].long(), packed[:, 3:], packed[:, 2])
 
     def block_table_tensor(self, tables: list[BlockTable]) -> tuple[torch.Tensor, torch.Tensor]:
         """Pad block tables into [batch, max_blocks] and lengths into [batch]."""
-        width = max(len(t.blocks) for t in tables)
-        table = torch.zeros(len(tables), width, dtype=torch.int32)
-        for row, t in enumerate(tables):
-            table[row, : len(t.blocks)] = torch.tensor(t.blocks, dtype=torch.int32)
-        lengths = torch.tensor([t.num_tokens for t in tables], dtype=torch.int32)
-        return table.to(self.device), lengths.to(self.device)
+        batch = self.decode_batch(tables)
+        return batch.table, batch.lengths
+
+
+@dataclass(frozen=True)
+class DecodeBatch:
+    """One decode step's tables on the device: where each new token's K and V go, the padded
+    block table [batch, max_blocks] and the lengths [batch] that include the new token."""
+
+    write_blocks: torch.Tensor
+    write_slots: torch.Tensor
+    table: torch.Tensor
+    lengths: torch.Tensor

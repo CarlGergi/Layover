@@ -556,8 +556,14 @@ def test_the_final_plan_is_the_default_and_puts_layover_against_vllm_first(qwen3
     cells = run_matrix.plan_cells(final, workloads, "final")
     pairs = {"layover-combined", "vllm"}
     assert [(c.system in pairs, c.load, c.run) for c in cells[:4]] == [(True, "load100", 0)] * 2 + [(True, "load100", 1)] * 2
-    assert [(c.system, c.run) for c in cells[4:6]] == [("layover-discard", 0), ("layover-discard", 1)]
-    assert {c.system for c in cells[6:]} == {"layover-keep_ttl", "layover-swap"} and len(cells) == 8
+    assert [(c.system, c.run) for c in cells[4:6]] == [("layover-discard", 0), ("layover-discard", 1)] and len(cells) == 6
+    # The single-policy ablations extend it, into the same results, at the same settings.
+    more = run_matrix.effective_config(config, "final-ablations")
+    assert more["matched"] == final["matched"] and more["workloads"] == final["workloads"]
+    extra = run_matrix.plan_cells(more, workloads, "final-ablations")
+    assert extra[:6] == cells and {(c.system, c.run) for c in extra[6:]} == {(s, r) for s in ("layover-keep_ttl", "layover-swap") for r in range(2)}
+    # Same config hash, so a resume into final's results directory is not refused.
+    assert run_matrix.stable_hash(more) == run_matrix.stable_hash(final)
     assert "sglang" not in {c.system for c in cells} and "SGLang is left out" in config["plans"]["final"]["description"]
     assert final["matched"]["cpu_offload_gib"] == 24.0
     assert final["workloads"][0]["max_jobs"] == 15 and "max_jobs" not in config["workloads"][0]
@@ -3242,7 +3248,7 @@ def test_the_dry_run_prices_every_plan_in_matrix_hours(capsys, qwen3_4b_config):
     systems = {spec["name"]: build_system(spec, SETTINGS, TOKEN_BYTES) for spec in run_matrix.system_specs(config)}
     run_matrix.dry_run(config, SETTINGS, systems, workloads, run_matrix.plan_cells(config, workloads, "first-pass"), pool_tokens=87381, plan_name="first-pass")
     printed = capsys.readouterr().out
-    for name, runs in (("first-pass", 60), ("under-20h", 41), ("three-loads-lean", 37), ("runpod-l4", 28), ("final", 8)):
+    for name, runs in (("first-pass", 60), ("under-20h", 41), ("three-loads-lean", 37), ("runpod-l4", 28), ("final", 6), ("final-ablations", 10)):
         assert re.search(rf"  {name}: {runs} runs, [\d.]+ to [\d.]+ matrix hours\.", printed)
 
 

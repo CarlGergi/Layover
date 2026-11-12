@@ -79,9 +79,9 @@ traces:
 baselines:
 	bash scripts/setup_baselines.sh
 
-# Three transfer paths. The last is what the matrix's cost model reads.
+# The native transfer path with BF16 and with FP8 offload. The last is what the matrix's cost model
+# reads. The plain path (bench/kv_crossover.py without --transfer) is left out to fit the budget.
 kv-crossover:
-	$(call unless_measured,results/kv_crossover_plain/cost_model.json,d.get('measured_on_gpu'),$(PYTHON) bench/kv_crossover.py --device cuda --model $(GPU_MODEL) --out results/kv_crossover_plain)
 	$(call unless_measured,results/kv_crossover_native_bf16/cost_model.json,d.get('measured_on_gpu'),$(PYTHON) bench/kv_crossover.py --device cuda --model $(GPU_MODEL) --transfer native --out results/kv_crossover_native_bf16)
 	$(call unless_measured,results/kv_crossover/cost_model.json,d.get('measured_on_gpu'),$(PYTHON) bench/kv_crossover.py --device cuda --model $(GPU_MODEL) --transfer native --offload-dtype fp8 --out results/kv_crossover)
 
@@ -111,7 +111,7 @@ matrix-report:
 matrix-pipeline-check: smoke
 	$(PYTHON) bench/run_matrix.py --config bench/configs/pipeline_check.json --out results/matrix_pipeline_check --pipeline-check --no-gpu
 
-# Every benchmark number for the chosen plan (--plan in MATRIX_ARGS, default under-20h).
+# Every benchmark number for the chosen plan (--plan in MATRIX_ARGS, default final).
 # Refuses without a CUDA GPU and the re-executed trace; a re-run skips what is finished.
 reproduce: kv-crossover decode-bandwidth transfer-gather matrix-preflight matrix matrix-report
 

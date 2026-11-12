@@ -379,17 +379,42 @@ def plan_matched(config: dict, name: str | None) -> dict:
     return {**(plan_matched(config, entry["extends"]) if "extends" in entry else {}), **entry.get("matched", {})}
 
 
+def plan_workloads(config: dict, name: str | None) -> dict:
+    """A plan's changes to workloads, by name, after those of any plan it extends."""
+    entry = config.get("plans", {}).get(name) if name else None
+    if entry is None:
+        return {}
+    merged = plan_workloads(config, entry["extends"]) if "extends" in entry else {}
+    for workload, changes in entry.get("workloads", {}).items():
+        merged[workload] = {**merged.get(workload, {}), **changes}
+    return merged
+
+
+WORKLOAD_CHANGES = {"max_jobs", "warmup_jobs"}
+
+
 def effective_config(config: dict, name: str | None) -> dict:
     """The config as a plan runs it. A plan may change matched settings, every system's at once,
-    for example a smaller CPU tier on a machine with less RAM. The manifest records and hashes the
-    result, so a resume at another plan's settings is refused like any other changed config."""
-    changes = plan_matched(config, name)
-    if not changes:
+    for example a smaller CPU tier on a machine with less RAM, and a workload's size: how many of
+    its jobs run and how many of those warm up. The manifest records and hashes the result, so a
+    resume at another plan's settings is refused like any other changed config."""
+    changes, workloads = plan_matched(config, name), plan_workloads(config, name)
+    if not changes and not workloads:
         return config
     unknown = sorted(set(changes) - set(config["matched"]))
     if unknown:
         raise Refused(f"plan {name!r} changes matched settings the config does not have: {unknown}")
-    return {**config, "matched": {**config["matched"], **changes}}
+    names = {entry["name"] for entry in config["workloads"]}
+    for workload, edits in workloads.items():
+        if workload not in names:
+            raise Refused(f"plan {name!r} changes workload {workload!r}, which the config does not have")
+        if set(edits) - WORKLOAD_CHANGES:
+            raise Refused(f"plan {name!r} may change only {sorted(WORKLOAD_CHANGES)} of a workload, not {sorted(set(edits) - WORKLOAD_CHANGES)}")
+    return {
+        **config,
+        "matched": {**config["matched"], **changes},
+        "workloads": [{**entry, **workloads.get(entry["name"], {})} for entry in config["workloads"]],
+    }
 
 
 def plan_roles(config: dict, name: str) -> set[str]:

@@ -20,8 +20,10 @@ not 128.
 
 ## Status
 
-**No benchmark results exist yet.** Nothing below has run on a GPU; GPU code has only been compiled
-for sm_89 and exercised through CPU stand-ins.
+**No benchmark results exist yet.** One GPU smoke run has passed on an NVIDIA L4 (RunPod): parity
+with the reference model, the Triton decode kernel on real KV, the native transfer path with BF16 and
+FP8, a server session through keep, swap and restore, and eight GPU tests. Everything else has only
+been exercised through CPU stand-ins.
 
 | Part | State |
 | --- | --- |
@@ -31,7 +33,24 @@ for sm_89 and exercised through CPU stand-ins.
 | Triton paged decode attention (`--decode-backend triton`) | Matches the PyTorch reference in Triton's interpreter on CPU; compiles for sm_89; never run on a GPU |
 | CUDA gather/scatter, copy stream, FP8 offload (`--transfer native --offload-dtype fp8`) | Host build and FP8 tested on CPU; CUDA build compiles; never run on a GPU |
 | KV crossover, decode bandwidth, transfer benchmarks | Written; pipeline-checked on CPU; no GPU numbers |
-| Benchmark matrix against vLLM and SGLang | Written; pipeline-checked on CPU against a stub; neither baseline has answered a real request |
+| Benchmark matrix against vLLM | Written; pipeline-checked on CPU against a stub; vLLM has not answered a real request yet |
+
+## Results
+
+Pending the final GPU session; every number here will come from `make reproduce` on one GPU type.
+
+- Prefill and decode rates of the engine before and after the hot-path work, and of vLLM at the same
+  shapes, profiled with Nsight Systems (`make profile`).
+- Decode attention bandwidth as a percentage of the card's peak, with the roofline argument for why
+  decode is bound by memory bandwidth (`make decode-bandwidth`).
+- Gathering scattered KV blocks for transfer (`make transfer-gather`), and the crossover between
+  swapping KV to CPU memory and recomputing it, with BF16 against FP8 offload (`make kv-crossover`).
+- The `final` matrix: Layover against vLLM at 100% load on SWE-bench agent trajectories, and the
+  `layover-discard` ablation.
+
+SGLang is not measured. The whole GPU budget for this project was $10, which covers one baseline;
+vLLM is the one the comparison is calibrated on. The matrix code supports SGLang
+(`bench/configs/baseline_flags.md`), and the other plans include it.
 
 ## Running
 
@@ -108,7 +127,8 @@ saturation rate, measured once and applied as the same absolute rates to every s
 
 | Plan | Headline: `layover-combined`, `vllm`, `sglang` | Ablations at 100% load |
 | --- | --- | --- |
-| `under-20h` (default) | 100% load 5 runs, 125% load 3 runs; then one 50% run each for `layover-combined` and `vllm` if time remains | 3 runs each |
+| `final` (default) | `layover-combined` and `vllm` only, 100% load, 2 runs, first 15 tasks; CPU tier 24 GiB | `layover-discard` 2 runs; `keep_ttl` and `swap` 1 run each if time remains |
+| `under-20h` | 100% load 5 runs, 125% load 3 runs; then one 50% run each for `layover-combined` and `vllm` if time remains | 3 runs each |
 | `first-pass` | 50%, 100%, 125% load, 5 runs each | 3 runs each |
 | `three-loads-lean` | all three loads, 3 runs each | 2 runs each |
 | `full` | as `first-pass`, plus synthetic sweeps | 3 runs each |

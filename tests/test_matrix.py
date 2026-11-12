@@ -548,6 +548,43 @@ def test_the_runpod_plan_puts_layover_against_vllm_first_then_sglang_then_ablati
     assert {(c.system, c.load, c.run) for c in cells[18:]} == {(s, "load100", r) for s in ABLATIONS for r in range(2)}
 
 
+def test_the_final_plan_is_the_default_and_puts_layover_against_vllm_first(qwen3_4b_config):
+    config = run_matrix.load_config(REPO / "bench/configs/matrix.json")
+    assert config["default_plan"] == "final" and smoke_default_plan() == "final"
+    final = run_matrix.effective_config(config, "final")
+    workloads = run_matrix.load_workloads(final, SETTINGS, False, dry_run=True)
+    cells = run_matrix.plan_cells(final, workloads, "final")
+    pairs = {"layover-combined", "vllm"}
+    assert [(c.system in pairs, c.load, c.run) for c in cells[:4]] == [(True, "load100", 0)] * 2 + [(True, "load100", 1)] * 2
+    assert [(c.system, c.run) for c in cells[4:6]] == [("layover-discard", 0), ("layover-discard", 1)]
+    assert {c.system for c in cells[6:]} == {"layover-keep_ttl", "layover-swap"} and len(cells) == 8
+    assert "sglang" not in {c.system for c in cells} and "SGLang is left out" in config["plans"]["final"]["description"]
+    assert final["matched"]["cpu_offload_gib"] == 24.0
+    assert final["workloads"][0]["max_jobs"] == 15 and "max_jobs" not in config["workloads"][0]
+
+
+def smoke_default_plan():
+    from bench import gpu_smoke
+
+    return gpu_smoke.DEFAULT_PLAN
+
+
+def test_a_plan_runs_fewer_jobs_of_a_workload_and_only_what_it_may_change():
+    config = run_matrix.load_config(REPO / "bench/configs/matrix.json")
+    config["plans"]["small"] = {"description": "x", "workloads": {"headline-swebench": {"max_jobs": 4, "warmup_jobs": 1}}, "groups": []}
+    small = run_matrix.effective_config(config, "small")
+    assert small["workloads"][0] | {"trace": "t"} == config["workloads"][0] | {"trace": "t", "max_jobs": 4, "warmup_jobs": 1}
+    config["plans"]["child"] = {"extends": "small", "description": "x", "workloads": {"headline-swebench": {"max_jobs": 6}}, "groups": []}
+    assert run_matrix.effective_config(config, "child")["workloads"][0]["max_jobs"] == 6
+    assert run_matrix.effective_config(config, "child")["workloads"][0]["warmup_jobs"] == 1
+    config["plans"]["ghost"] = {"description": "x", "workloads": {"nope": {"max_jobs": 1}}, "groups": []}
+    with pytest.raises(Refused, match="workload 'nope'"):
+        run_matrix.effective_config(config, "ghost")
+    config["plans"]["trace"] = {"description": "x", "workloads": {"headline-swebench": {"trace": "other.jsonl"}}, "groups": []}
+    with pytest.raises(Refused, match="may change only"):
+        run_matrix.effective_config(config, "trace")
+
+
 def test_a_plan_changes_the_matched_settings_of_every_system_and_nothing_else():
     config = run_matrix.load_config(REPO / "bench/configs/matrix.json")
     runpod = run_matrix.effective_config(config, "runpod-l4")
@@ -556,6 +593,7 @@ def test_a_plan_changes_the_matched_settings_of_every_system_and_nothing_else():
     assert config["matched"]["cpu_offload_gib"] == 32.0, "the loaded config must not change"
     for plan in ("under-20h", "first-pass", None, "not-a-plan"):
         assert run_matrix.effective_config(config, plan) is config
+    assert run_matrix.effective_config(config, "runpod-l4")["workloads"] == config["workloads"]
     # What a plan extends comes first, and the plan's own changes win.
     config["plans"]["child"] = {"extends": "runpod-l4", "description": "x", "matched": {"kv_gib": 10.0}, "groups": []}
     assert run_matrix.effective_config(config, "child")["matched"] == {**config["matched"], "cpu_offload_gib": 24.0, "kv_gib": 10.0}
@@ -3155,7 +3193,6 @@ def test_a_higher_limit_on_a_resume_gives_room_for_what_is_left(tmp_path):
 
 def test_under_20h_is_load100_first_then_load125_then_the_ablations_then_the_low_load_check(qwen3_4b_config):
     config, cells = published_plan(qwen3_4b_config, "under-20h")
-    assert config["default_plan"] == "under-20h"
     assert len(cells) == 15 + 9 + 15 + 2 and len(set(cells)) == len(cells)
     assert {(c.system, c.run) for c in cells[:15]} == {(s, r) for s in HEADLINE for r in range(5)} and {c.load for c in cells[:15]} == {"load100"}
     assert [c.run for c in cells[:15]] == [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4]
@@ -3174,7 +3211,7 @@ def test_three_loads_lean_is_three_runs_at_each_load_then_two_of_each_ablation(q
 
 
 def test_every_new_plan_can_compare_each_ablation_on_seeds_the_reference_has(qwen3_4b_config):
-    for name in ("under-20h", "three-loads-lean", "runpod-l4"):
+    for name in ("under-20h", "three-loads-lean", "runpod-l4", "final"):
         _, cells = published_plan(qwen3_4b_config, name)
         reference = {c.run for c in cells if c.system == "layover-combined" and c.load == "load100"}
         for system in ABLATIONS:
@@ -3205,6 +3242,6 @@ def test_the_dry_run_prices_every_plan_in_matrix_hours(capsys, qwen3_4b_config):
     systems = {spec["name"]: build_system(spec, SETTINGS, TOKEN_BYTES) for spec in run_matrix.system_specs(config)}
     run_matrix.dry_run(config, SETTINGS, systems, workloads, run_matrix.plan_cells(config, workloads, "first-pass"), pool_tokens=87381, plan_name="first-pass")
     printed = capsys.readouterr().out
-    for name, runs in (("first-pass", 60), ("under-20h", 41), ("three-loads-lean", 37), ("runpod-l4", 28)):
+    for name, runs in (("first-pass", 60), ("under-20h", 41), ("three-loads-lean", 37), ("runpod-l4", 28), ("final", 8)):
         assert re.search(rf"  {name}: {runs} runs, [\d.]+ to [\d.]+ matrix hours\.", printed)
 

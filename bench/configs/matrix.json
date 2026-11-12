@@ -42,7 +42,7 @@
     {"name": "layover-discard", "kind": "layover", "policy": "discard"},
     {"name": "layover-discard-nocache", "kind": "layover", "policy": "discard", "prefix_cache": false, "label": "lower bound"}
   ],
-  "default_plan": "under-20h",
+  "default_plan": "final",
   "plans": {
     "first-pass": {
       "description": "Headline systems at three loads x 5 runs, then each ablation at 100% load x 3 runs. Ordered so a budget stop keeps the most valuable cells.",
@@ -72,6 +72,18 @@
         {"role": "headline", "systems": ["layover-combined", "vllm", "sglang"], "loads": [1.0], "runs": 3},
         {"role": "headline", "systems": ["layover-combined", "vllm", "sglang"], "loads": [1.25, 0.5], "runs": 3},
         {"role": "headline", "systems": ["layover-discard", "layover-discard-nocache", "layover-combined-bf16", "layover-keep_ttl", "layover-swap"], "loads": [1.0], "runs": 2}
+      ]
+    },
+    "final": {
+      "description": "What a $10 GPU budget buys on one 24 GB card: Layover against vLLM at 100% load x 2 on the first 15 tasks, then layover-discard x 2, then keep_ttl and swap x 1 each if the budget remains. The CPU tier is 24 GiB for every system. SGLang is left out for the budget.",
+      "matched": {"cpu_offload_gib": 24.0},
+      "workloads": {"headline-swebench": {"max_jobs": 15}},
+      "budget_hours": 12,
+      "other_stages_hours": 1.5,
+      "groups": [
+        {"role": "headline", "systems": ["layover-combined", "vllm"], "loads": [1.0], "runs": 2},
+        {"role": "headline", "systems": ["layover-discard"], "loads": [1.0], "runs": 2},
+        {"role": "headline", "systems": ["layover-keep_ttl", "layover-swap"], "loads": [1.0], "runs": 1}
       ]
     },
     "runpod-l4": {

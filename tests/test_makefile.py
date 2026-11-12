@@ -39,13 +39,14 @@ def put(tree, path, content):
     target.write_text(content if isinstance(content, str) else json.dumps(content))
 
 
-CROSSOVERS = ["kv_crossover_plain", "kv_crossover_native_bf16", "kv_crossover"]
+CROSSOVERS = ["kv_crossover_native_bf16", "kv_crossover"]
 
 
-def test_crossover_measures_all_three_paths_when_nothing_exists(tree):
+def test_crossover_measures_bf16_then_fp8_offload_when_nothing_exists(tree):
     calls = make(tree, "kv-crossover")
-    assert len(calls) == 3
-    assert "--out results/kv_crossover" in calls[2] and "--offload-dtype fp8" in calls[2]
+    assert len(calls) == 2
+    assert "--transfer native" in calls[0] and "--offload-dtype" not in calls[0]
+    assert "--out results/kv_crossover" in calls[1] and "--offload-dtype fp8" in calls[1]
 
 
 def test_crossover_keeps_finished_cost_models_so_a_resume_is_not_refused(tree):
@@ -55,7 +56,7 @@ def test_crossover_keeps_finished_cost_models_so_a_resume_is_not_refused(tree):
 
 
 def test_only_the_missing_crossover_runs(tree):
-    for name in CROSSOVERS[:2]:
+    for name in CROSSOVERS[:1]:
         put(tree, f"results/{name}/cost_model.json", MEASURED)
     calls = make(tree, "kv-crossover")
     assert len(calls) == 1 and "--offload-dtype fp8" in calls[0]
@@ -64,13 +65,13 @@ def test_only_the_missing_crossover_runs(tree):
 def test_a_cpu_cost_model_does_not_count_as_measured(tree):
     for name in CROSSOVERS:
         put(tree, f"results/{name}/cost_model.json", {"measured_on_gpu": False})
-    assert len(make(tree, "kv-crossover")) == 3
+    assert len(make(tree, "kv-crossover")) == 2
 
 
 def test_force_re_measures(tree):
     for name in CROSSOVERS:
         put(tree, f"results/{name}/cost_model.json", MEASURED)
-    assert len(make(tree, "kv-crossover", FORCE=1)) == 3
+    assert len(make(tree, "kv-crossover", FORCE=1)) == 2
 
 
 @pytest.mark.parametrize("target,path", [

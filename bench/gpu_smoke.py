@@ -47,7 +47,7 @@ from bench.systems import BLOCK_TOKENS, _descendants, _kill_quietly  # noqa: E40
 
 DEFAULT_CONFIG = REPO / "bench" / "configs" / "matrix.json"
 PIPELINE_LABEL = "PIPELINE CHECK on CPU: micro model, host build. Measures nothing about a GPU."
-DEFAULT_PLAN = "under-20h"
+DEFAULT_PLAN = "final"
 
 # A normal run is about 10 minutes (an assumption until the first GPU session). This limit is on
 # the broken case: a check that starts past it is recorded as blocked.

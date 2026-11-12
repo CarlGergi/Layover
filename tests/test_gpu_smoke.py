@@ -383,7 +383,7 @@ def test_refine_plan_asks_run_matrix_with_the_rates_and_leaves_a_line_for_the_sh
     calls = fake_pytest(monkeypatch, output)
     details = smoke.check_refine_plan(context(tmp_path))
     argv = calls[0]
-    assert argv[argv.index("--plan") + 1] == "under-20h" and "--dry-run" in argv
+    assert argv[argv.index("--plan") + 1] == "final" and "--dry-run" in argv
     assert argv[argv.index("--measured-rates") + 1] == str(tmp_path / "measured_rates.json")
     assert details["low_hours"] == 12.5 and details["high_hours"] == 19.25
     written = (tmp_path / "refined_hours.txt").read_text().splitlines()
@@ -393,9 +393,9 @@ def test_refine_plan_asks_run_matrix_with_the_rates_and_leaves_a_line_for_the_sh
 
 def test_the_plan_to_price_comes_from_the_argument_then_the_environment_then_the_default(monkeypatch):
     monkeypatch.delenv("SMOKE_PLAN", raising=False)
-    assert smoke.parse_args([]).plan == "under-20h"
+    assert smoke.parse_args([]).plan == "final"
     monkeypatch.setenv("SMOKE_PLAN", "")
-    assert smoke.parse_args([]).plan == "under-20h"
+    assert smoke.parse_args([]).plan == "final"
     monkeypatch.setenv("SMOKE_PLAN", "first-pass")
     assert smoke.parse_args([]).plan == "first-pass"
     assert smoke.parse_args(["--plan", "three-loads-lean"]).plan == "three-loads-lean"

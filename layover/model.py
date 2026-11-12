@@ -185,6 +185,8 @@ class Qwen3(nn.Module):
         freqs = 1.0 / (cfg.rope_theta ** (torch.arange(0, cfg.head_dim, 2, dtype=torch.float32) / cfg.head_dim))
         self.register_buffer("inv_freq", freqs, persistent=False)
         self.decode_attention = paged_decode_attention_torch
+        # A layover.decode_graphs.DecodeGraphs, when small batches replay captured CUDA graphs.
+        self.decode_graphs = None
         # Names made once, since a range is opened per layer per step.
         self._range_names = [(f"layer{i}.attention", f"layer{i}.mlp") for i in range(cfg.num_hidden_layers)]
 
@@ -233,13 +235,21 @@ class Qwen3(nn.Module):
         with nvtx_range("decode"):
             for table in tables:
                 cache.prepare_write(table, table.num_tokens, table.num_tokens + 1)
-            batch = cache.decode_batch(tables)
-            x = self.model.embed_tokens(tokens)[:, None]
-            # The position of each new token is its length less one.
-            cos, sin = self.rope((batch.lengths.long() - 1)[:, None], x.dtype)
-            for layer, (attention_name, mlp_name) in zip(self.model.layers, self._range_names):
-                with nvtx_range(attention_name):
-                    attended = layer.self_attn.forward_decode(layer.input_layernorm(x), cos, sin, cache, batch, self.decode_attention)
-                with nvtx_range(mlp_name):
-                    x = layer.finish(x, attended)
-            return self.lm_head(self.model.norm(x)[:, 0])
+            if self.decode_graphs is not None:
+                logits = self.decode_graphs.run(tables, tokens)
+                if logits is not None:
+                    return logits
+            return self.decode_step(cache, cache.decode_batch(tables), tokens)
+
+    def decode_step(self, cache: PagedKVCache, batch: DecodeBatch, tokens: torch.Tensor) -> torch.Tensor:
+        """The device side of a decode step: no host reads and no host data, so a CUDA graph can
+        capture it once and replay it with new contents in the same tensors."""
+        x = self.model.embed_tokens(tokens)[:, None]
+        # The position of each new token is its length less one.
+        cos, sin = self.rope((batch.lengths.long() - 1)[:, None], x.dtype)
+        for layer, (attention_name, mlp_name) in zip(self.model.layers, self._range_names):
+            with nvtx_range(attention_name):
+                attended = layer.self_attn.forward_decode(layer.input_layernorm(x), cos, sin, cache, batch, self.decode_attention)
+            with nvtx_range(mlp_name):
+                x = layer.finish(x, attended)
+        return self.lm_head(self.model.norm(x)[:, 0])

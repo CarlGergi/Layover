@@ -426,6 +426,7 @@ def main(argv=None) -> None:
     p.add_argument("--decode-backend", default="torch", choices=["torch", "triton"], help="triton needs a Linux install of it")
     p.add_argument("--transfer", default="plain", choices=["plain", "native"], help="native needs make -C native cuda or host")
     p.add_argument("--offload-dtype", default="bf16", choices=["bf16", "fp8"], help="fp8 needs triton")
+    p.add_argument("--cuda-graphs", action="store_true", help="replay decode at batch 1, 2, 4 and 8 from CUDA graphs; needs --device cuda and --decode-backend triton")
     p.add_argument("--max-batch", type=int, default=32)
     p.add_argument("--prefill-chunk", type=int, default=512)
     p.add_argument("--host", default="127.0.0.1")
@@ -444,6 +445,12 @@ def main(argv=None) -> None:
     token_bytes = model.cfg.kv_bytes_per_token(args.dtype)
     block_bytes = token_bytes * args.block_tokens
     cache = PagedKVCache(model.cfg, int(args.pool_gib * 2**30 / block_bytes), args.device, dtype, args.block_tokens)
+    if args.cuda_graphs:
+        if args.device != "cuda" or args.decode_backend != "triton":
+            raise SystemExit("--cuda-graphs needs --device cuda and --decode-backend triton: the torch decode backend reads lengths back")
+        from layover.decode_graphs import DecodeGraphs
+
+        model.decode_graphs = DecodeGraphs(model, cache)
     agent = AgentConfig(
         policy=Policy(args.policy),
         ttl_cap_s=args.ttl_cap_s,

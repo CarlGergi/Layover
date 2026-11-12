@@ -3256,3 +3256,13 @@ def test_baselines_start_with_their_environment_first_on_path(monkeypatch):
             assert system.environment()["PATH"] == f"{Path(spec['venv']) / 'bin'}:/usr/bin"
         elif system.kind == "layover":
             assert "PATH" not in system.environment()
+
+
+def test_layover_systems_decode_through_cuda_graphs_in_the_published_config():
+    config = run_matrix.load_config(REPO / "bench/configs/matrix.json")
+    for spec in run_matrix.system_specs(config):
+        system = build_system(spec, SETTINGS, TOKEN_BYTES)
+        if system.kind == "layover":
+            assert system.command("127.0.0.1", 9)[-1] == "--cuda-graphs" or "--cuda-graphs" in system.command("127.0.0.1", 9)
+    off = build_system({**run_matrix.system_specs(config)[0], "cuda_graphs": False}, SETTINGS, TOKEN_BYTES)
+    assert "--cuda-graphs" not in off.command("127.0.0.1", 9)

@@ -30,7 +30,8 @@
     "ttl_cap_s": 30.0,
     "decode_backend": "triton",
     "transfer": "native",
-    "offload_dtype": "fp8"
+    "offload_dtype": "fp8",
+    "cuda_graphs": true
   },
   "systems": [
     {"name": "layover-combined", "kind": "layover", "policy": "combined"},

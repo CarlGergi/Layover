@@ -45,7 +45,7 @@ def median_after_warmup(samples: list[float]) -> float:
     return statistics.median(samples[1:] if len(samples) > 1 else samples)
 
 
-def layover_rates(model_name: str, device_name: str, plan: dict, torch_trace: Path | None) -> dict:
+def layover_rates(model_name: str, device_name: str, plan: dict, torch_trace: Path | None, cuda_graphs: bool = False) -> dict:
     import torch
 
     from bench.kv_crossover import load_layover_model, make_ids, timed
@@ -61,6 +61,10 @@ def layover_rates(model_name: str, device_name: str, plan: dict, torch_trace: Pa
     chunk = plan["chunk"]
     longest = max(plan["contexts"] + [plan["decode_context"]]) + chunk
     cache = PagedKVCache(cfg, longest // 16 + max(plan["batches"]) + 16, device, torch.bfloat16)
+    if cuda_graphs:
+        from layover.decode_graphs import DecodeGraphs, cuda_graph, eager_graph
+
+        model.decode_graphs = DecodeGraphs(model, cache, max_tokens=longest, capture=cuda_graph if device.type == "cuda" else eager_graph)
     ids = make_ids(cfg, longest, device, 0)
     prefill, decode = {}, {}
 
@@ -152,6 +156,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--quick", action="store_true", help="fewer shapes, for an nsys capture")
+    p.add_argument("--cuda-graphs", action="store_true", help="decode through captured CUDA graphs at small batches")
     p.add_argument("--torch-trace", action="store_true", help="also record torch.profiler traces of one prefill chunk and one decode step")
     return p.parse_args(argv)
 
@@ -166,10 +171,10 @@ def main(argv=None) -> int:
     model = args.model if on_gpu else "micro"
     args.out.mkdir(parents=True, exist_ok=True)
     if args.system == "layover":
-        rates = layover_rates(model, args.device, plan, args.out if args.torch_trace else None)
+        rates = layover_rates(model, args.device, plan, args.out if args.torch_trace else None, args.cuda_graphs)
     else:
         rates = vllm_rates(model, plan)
-    result = {"system": args.system, "model": model, "device": args.device, "shapes": plan, **rates}
+    result = {"system": args.system, "model": model, "device": args.device, "shapes": plan, "cuda_graphs": args.cuda_graphs, **rates}
     if not on_gpu:
         result["label"] = PIPELINE_LABEL
     (args.out / "rates.json").write_text(json.dumps(result, indent=2) + "\n")

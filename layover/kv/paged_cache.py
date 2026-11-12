@@ -148,18 +148,25 @@ class PagedKVCache:
         checks are the ones a kernel cannot make for itself, since a bad block id there reads
         another sequence's memory or takes the device down; here they cost no GPU read.
         """
-        width = max(len(t.blocks) for t in tables)
+        packed = self._to_device(self.decode_rows(tables))
+        return DecodeBatch(packed[:, 0].long(), packed[:, 1].long(), packed[:, 3:], packed[:, 2])
+
+    def decode_rows(self, tables: list[BlockTable], width: int | None = None) -> torch.Tensor:
+        """decode_batch's rows on the host, int32 [batch, 3 + width]: write block, write slot,
+        length, then the block table padded to `width` blocks (default: the widest table)."""
+        width = max(len(t.blocks) for t in tables) if width is None else width
         rows = []
         for t in tables:
             if not 1 <= t.num_tokens <= len(t.blocks) * self.block_tokens:
                 raise ValueError(f"a table of {len(t.blocks)} blocks cannot hold {t.num_tokens} tokens")
             if t.blocks and not 0 <= min(t.blocks) <= max(t.blocks) < self.allocator.num_blocks:
                 raise ValueError(f"block ids {t.blocks} are outside a pool of {self.allocator.num_blocks} blocks")
+            if len(t.blocks) > width:
+                raise ValueError(f"a table of {len(t.blocks)} blocks does not fit a width of {width}")
             last = t.num_tokens - 1
             # Padding repeats block 0, a real block, and the kernel never reads past a length.
             rows.append([t.blocks[last // self.block_tokens], last % self.block_tokens, t.num_tokens, *t.blocks, *[0] * (width - len(t.blocks))])
-        packed = self._to_device(torch.tensor(rows, dtype=torch.int32))
-        return DecodeBatch(packed[:, 0].long(), packed[:, 1].long(), packed[:, 3:], packed[:, 2])
+        return torch.tensor(rows, dtype=torch.int32)
 
     def block_table_tensor(self, tables: list[BlockTable]) -> tuple[torch.Tensor, torch.Tensor]:
         """Pad block tables into [batch, max_blocks] and lengths into [batch]."""

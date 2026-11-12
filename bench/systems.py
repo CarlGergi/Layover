@@ -382,7 +382,7 @@ class LayoverSystem(System):
     def __init__(
         self, name, settings, kv_bytes_per_token, policy: str, cost_model: str, ttl_cap_s: float = 30.0,
         decode_backend: str | None = None, transfer: str | None = None, offload_dtype: str | None = None,
-        prefix_cache: bool = True, record_bytes: int | None = None,
+        prefix_cache: bool = True, record_bytes: int | None = None, cuda_graphs: bool = False,
     ):
         super().__init__(name, settings, kv_bytes_per_token)
         self.policy = policy
@@ -393,6 +393,7 @@ class LayoverSystem(System):
         self.transfer = transfer
         self.offload_dtype = offload_dtype
         self.record_bytes = record_bytes
+        self.cuda_graphs = cuda_graphs
 
     @property
     def recomputes_context(self) -> bool:
@@ -424,6 +425,8 @@ class LayoverSystem(System):
                 command += [flag, value]
         if not self.prefix_cache:
             command.append("--no-prefix-cache")
+        if self.cuda_graphs:
+            command.append("--cuda-graphs")
         return command
 
     def _metrics(self, client) -> dict:
@@ -501,6 +504,7 @@ def build_system(spec: dict, settings: MatchedSettings, kv_bytes_per_token: int,
             spec["name"], settings, kv_bytes_per_token, spec["policy"], spec["cost_model"], spec.get("ttl_cap_s", 30.0),
             spec.get("decode_backend"), spec.get("transfer"), spec.get("offload_dtype"), spec.get("prefix_cache", True),
             offload_record_bytes(cfg, spec.get("offload_dtype")) if cfg is not None else None,
+            spec.get("cuda_graphs", False),
         )
     if kind == "command":
         return CommandSystem(spec["name"], settings, kv_bytes_per_token, spec["command"])

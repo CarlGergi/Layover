@@ -180,3 +180,33 @@ def test_flash_prefill_matches_the_masked_path_with_no_mask_built(start):
     )
     assert chunk._masks == {}
     assert (got.float() - expected).abs().max() < 2.0**-6
+
+
+def test_decode_through_a_real_cuda_graph_matches_eager_decode():
+    """Batch 1, 3 padded to 4, and 8, through captured graphs with the trusted Triton kernel."""
+    from layover.decode_graphs import DecodeGraphs
+    from layover.kernels.triton_decode import paged_decode_attention_triton_trusted
+
+    torch.manual_seed(0)
+    model = Qwen3(CFG).to(dtype=torch.bfloat16, device="cuda").eval()
+    model.decode_attention = paged_decode_attention_triton_trusted
+    for lengths in ([5], [1, 17, 40], [9] * 8):
+        caches = []
+        for _ in range(2):
+            cache = PagedKVCache(CFG, 64, "cuda", torch.bfloat16)
+            tables = []
+            for i, n in enumerate(lengths):
+                table = BlockTable()
+                model.prefill(cache, table, (torch.arange(n, device="cuda") * (i + 3)) % CFG.vocab_size, 0)
+                tables.append(table)
+            caches.append((cache, tables))
+        graphs = DecodeGraphs(model, caches[1][0], max_tokens=256)
+        tokens = torch.arange(len(lengths), device="cuda") + 1
+        for _ in range(18):
+            model.decode_graphs = None
+            expected = model.decode(*caches[0], tokens)
+            model.decode_graphs = graphs
+            got = model.decode(*caches[1], tokens)
+            assert torch.equal(got, expected)
+            tokens = expected.argmax(-1)
+        model.decode_graphs = None

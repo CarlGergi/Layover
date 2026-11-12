@@ -407,3 +407,9 @@ def test_real_weights_tool_call_round_trip(checkpoint):
         assert "18" in second["choices"][0]["message"]["content"]
     finally:
         served.close()
+
+
+def test_cuda_graphs_are_refused_where_they_cannot_run(monkeypatch, tmp_path):
+    """The torch decode backend reads lengths back, which a graph cannot capture, and a CPU has none."""
+    with pytest.raises(SystemExit, match="--cuda-graphs needs"):
+        run_main_until_scheduler(monkeypatch, tmp_path, ["--cuda-graphs"])

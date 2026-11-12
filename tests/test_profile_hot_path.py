@@ -33,3 +33,9 @@ def test_the_gpu_shapes_match_the_matrix_chunk_and_reach_its_long_contexts():
         assert plan["chunk"] == 2048 and 0 in plan["contexts"] and 8192 in plan["contexts"]
         assert 32 in plan["batches"] and plan["repeats"] >= 3
     assert max(profile.shapes(True, False)["contexts"]) == 32768
+
+
+def test_decode_can_run_through_graphs(tmp_path):
+    assert profile.main(["--device", "cpu", "--out", str(tmp_path), "--cuda-graphs"]) == 0
+    rates = json.loads((tmp_path / "rates.json").read_text())
+    assert rates["cuda_graphs"] is True and all(v > 0 for v in rates["decode_step_s"].values())

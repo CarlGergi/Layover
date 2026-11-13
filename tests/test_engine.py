@@ -257,6 +257,7 @@ def real_close(got, expected):
     return (got - expected).abs().max() <= 4 * BF16_EPS * expected.abs().max().item()
 
 
+@pytest.mark.weights
 def test_real_weights_per_layer_outputs_match_transformers(real_pair):
     hf, model, tokenizer, device = real_pair
     for text in REAL_PROMPTS:
@@ -274,6 +275,7 @@ def test_real_weights_per_layer_outputs_match_transformers(real_pair):
         assert real_close(logits, out.logits[0])
 
 
+@pytest.mark.weights
 def test_real_weights_greedy_output_matches_at_batch_size_one(real_pair):
     hf, model, tokenizer, device = real_pair
     for text in REAL_PROMPTS[:8]:

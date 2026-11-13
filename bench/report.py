@@ -888,8 +888,8 @@ def write_report(out: str | Path) -> Path:
         "",
         "Baseline versions: " + (", ".join(f"{k} {v}" for k, v in sorted(host.get("baseline_versions", {}).items())) or "none") + ".",
         "",
-        f"Config: `manifest.json` here holds it in full; flag reasons are in `bench/configs/baseline_flags.md`. "
-        f"Dependency versions of each baseline: `env/`.",
+        "Config: `manifest.json` here holds it in full; flag reasons are in `bench/configs/baseline_flags.md`. "
+        "Dependency versions of each baseline: `env/`.",
         "",
         manifest["first_token_note"],
         "",

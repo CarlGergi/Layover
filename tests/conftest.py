@@ -15,6 +15,12 @@ def pytest_addoption(parser):
 
 
 def pytest_collection_modifyitems(config, items):
+    # CI has no network for tests: LAYOVER_OFFLINE=1 skips those that download weights or a tokenizer.
+    if os.environ.get("LAYOVER_OFFLINE") == "1":
+        skip_weights = pytest.mark.skip(reason="needs downloaded Hugging Face files; LAYOVER_OFFLINE=1 is set")
+        for item in items:
+            if "weights" in item.keywords:
+                item.add_marker(skip_weights)
     if config.getoption("--gpu"):
         return
     skip_gpu = pytest.mark.skip(reason="needs a CUDA GPU; run with --gpu")

@@ -232,13 +232,13 @@ def measure(model, cfg, tokens, args, device, transfer=None) -> Row:
     for i in range(args.warmup + args.repeats):
         if i == args.warmup:
             pins_at_start = pins_so_far(transfer)
-        holder: list = []
+        holder = []
         if args.backend == "layover":
             # Allocated outside the clock: a server's pool already exists when it recomputes.
             holder.append(new_cache(model, ids, DTYPES[args.dtype]))
-            prefill = lambda: prefill_into(model, holder[0], ids, args.chunk)  # noqa: E731
+            prefill = lambda holder=holder: prefill_into(model, holder[0], ids, args.chunk)  # noqa: E731
         else:
-            prefill = lambda: holder.append(hf_prefill(model, ids, args.chunk))  # noqa: E731
+            prefill = lambda holder=holder: holder.append(hf_prefill(model, ids, args.chunk))  # noqa: E731
         recompute_s = timed(device, prefill)
         kv = [holder[0].pool] if args.backend == "layover" else holder[0]
         if sum(t.numel() for t in kv) * kv[0].element_size() != tokens * cfg.kv_bytes_per_token(args.dtype):

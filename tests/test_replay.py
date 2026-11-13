@@ -193,6 +193,7 @@ def test_http_replay_without_hints_works_like_a_plain_openai_client(micro_model)
         served.close()
 
 
+@pytest.mark.weights
 def test_cli_generate_and_convert(tmp_path):
     out = tmp_path / "t.jsonl"
     cli(["generate", "--shape", "bfcl", "--jobs", "3", "--branching", "1", "--tool-median-s", "2", "--out", str(out)])

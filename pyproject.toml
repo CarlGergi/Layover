@@ -32,4 +32,17 @@ testpaths = ["tests"]
 pythonpath = ["."]
 markers = [
     "gpu: needs a CUDA GPU; enable with --gpu",
+    "weights: downloads Hugging Face weights or a tokenizer; skipped when LAYOVER_OFFLINE=1",
 ]
+
+[tool.ruff]
+target-version = "py311"
+extend-exclude = ["traces", "results"]
+
+[tool.ruff.lint]
+# `l` is the load label in short loops over (workload, system, load, run) keys.
+ignore = ["E741"]
+
+[tool.ruff.lint.per-file-ignores]
+# Fixtures imported from a shared module and then taken as test parameters.
+"tests/*" = ["F811"]

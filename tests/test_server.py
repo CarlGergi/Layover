@@ -364,6 +364,7 @@ def test_malformed_tool_call_stays_in_the_content():
     assert parse_tool_calls(text) == (text, [])
 
 
+@pytest.mark.weights
 def test_real_weights_tool_call_round_trip(checkpoint):
     from layover.weights import load_model, resolve_checkpoint
 

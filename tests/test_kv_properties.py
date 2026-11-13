@@ -4,7 +4,7 @@ import pytest
 import torch
 from hypothesis import given, settings
 from hypothesis import strategies as st
-from hypothesis.stateful import Bundle, RuleBasedStateMachine, consumes, invariant, precondition, rule
+from hypothesis.stateful import Bundle, RuleBasedStateMachine, invariant, precondition, rule
 
 from layover.config import ModelConfig
 from layover.kv import BlockAllocator, BlockTable, OutOfBlocks, PagedKVCache

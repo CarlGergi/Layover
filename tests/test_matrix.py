@@ -86,7 +86,6 @@ import csv  # noqa: E402
 import hashlib  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
-import shlex  # noqa: E402
 import signal  # noqa: E402
 import socket  # noqa: E402
 import subprocess  # noqa: E402
@@ -112,7 +111,7 @@ from bench.systems import (  # noqa: E402
 from layover.config import ModelConfig  # noqa: E402
 from layover.replay.http_replay import job_tool_s, replay  # noqa: E402
 from layover.replay.results import ReplayResult, percentile, summarize  # noqa: E402
-from layover.replay.trace import SyntheticWorkload, TraceJob, TraceSession, TraceTurn, generate, save_jsonl  # noqa: E402
+from layover.replay.trace import TraceJob, TraceSession, TraceTurn, save_jsonl  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 SETTINGS = MatchedSettings("Qwen/Qwen3-4B", "cuda", "bf16", 40960, 12.0, 32.0, 32, 2048, 0)
@@ -887,6 +886,7 @@ def test_dry_run_prints_every_command_and_an_estimate_without_starting_anything(
     assert not Path("/nonexistent").exists()
 
 
+@pytest.mark.weights
 def test_published_config_refuses_cpu_and_stand_ins_without_pipeline_check(tmp_path, monkeypatch):
     with pytest.raises(Refused, match="device 'cpu'"):
         run_matrix.main(["--config", str(REPO / "bench/configs/pipeline_check.json"), "--out", str(tmp_path / "o")])
@@ -905,6 +905,7 @@ def test_only_that_matches_nothing_is_refused(qwen3_4b_config):
         run_matrix.main(["--config", str(REPO / "bench/configs/matrix.json"), "--dry-run", "--only", "nothing/*"])
 
 
+@pytest.mark.weights
 def test_preflight_runs_before_the_trace_exists_and_leaves_nothing_a_run_must_agree_with(tmp_path, monkeypatch):
     config = json.loads((REPO / "bench/configs/pipeline_check.json").read_text())
     config["workloads"] = [{"name": "headline", "role": "headline", "trace": str(tmp_path / "not-yet.jsonl"), "calibration_group": "g"}]
@@ -923,6 +924,7 @@ def test_preflight_runs_before_the_trace_exists_and_leaves_nothing_a_run_must_ag
         run_matrix.main(arguments)
 
 
+@pytest.mark.weights
 def test_the_baselines_can_be_preflighted_with_no_cost_model_or_trace(tmp_path, monkeypatch, qwen3_4b_config):
     called = []
     monkeypatch.setattr(run_matrix, "preflight", lambda ctx, names, out: called.append(names))
@@ -1528,6 +1530,7 @@ def pipeline_config(tmp_path: Path, **changes) -> Path:
     return path
 
 
+@pytest.mark.weights
 def test_pipeline_check_end_to_end_with_a_real_server(tmp_path):
     """The real layover.server and two stand-in baselines, through calibration, runs, resume, and report."""
     out = tmp_path / "out"
@@ -1655,6 +1658,7 @@ def test_the_layover_command_parses_with_the_real_server():
         assert policy in done.stdout
 
 
+@pytest.mark.weights
 def test_a_server_that_breaks_its_budget_fails_the_run_and_is_reported(tmp_path):
     """A stand-in claiming the wrong KV capacity must not produce a number."""
     out = tmp_path / "out"
@@ -2700,6 +2704,7 @@ def test_the_fairness_notes_cite_what_was_read_and_state_the_budgets():
     assert "sharing index" not in notes.lower()
 
 
+@pytest.mark.weights
 def test_the_real_pipeline_survives_a_kill_and_moves_to_a_new_machine(tmp_path):
     """The real runner, server and stand-in baselines: SIGKILL everything, resume under a new instance id."""
     out = tmp_path / "out"
@@ -3137,6 +3142,7 @@ def main_arguments(tmp_path):
     return ["--config", str(pipeline_config(tmp_path)), "--out", str(tmp_path / "out"), "--pipeline-check", "--no-gpu", "--skip-preflight"]
 
 
+@pytest.mark.weights
 @pytest.mark.parametrize("error", [Refused("SATURATION NOT FOUND for g"), ServerFailed("preflight died")], ids=["refused", "crash"])
 def test_a_session_that_ends_badly_still_writes_its_report(tmp_path, monkeypatch, error):
     def stops(*_):
@@ -3218,6 +3224,7 @@ def test_a_spent_budget_starts_nothing_and_the_report_says_what_was_not_run(tmp_
     assert re.search(r"Matrix time so far: 2\.00 hours over 2 sessions on 2 instances, against --max-hours 2\.", text)
 
 
+@pytest.mark.weights
 def test_main_takes_the_budget_from_the_results_directory(tmp_path):
     """Through the real command line: a replacement machine with a spent budget runs nothing."""
     out = tmp_path / "out"

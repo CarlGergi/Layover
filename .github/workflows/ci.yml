@@ -1,0 +1,47 @@
+name: CI
+
+# Lint and the CPU test suite on every push. No GPU, and no network once dependencies are in:
+# tests that need downloaded model weights are skipped (LAYOVER_OFFLINE), and the Hugging Face
+# libraries are told to stay offline. GPU tests skip without --gpu.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uvx ruff@0.14.0 check .
+
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      LAYOVER_OFFLINE: "1"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: pyproject.toml
+      - name: Install (CPU-only PyTorch; Triton for its interpreter)
+        run: |
+          uv venv .venv
+          uv pip install --python .venv/bin/python torch==2.15.0 --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --python .venv/bin/python -e ".[dev]" triton==3.9.0
+      - name: Test
+        run: .venv/bin/python -m pytest -q -p no:cacheprovider --durations=15

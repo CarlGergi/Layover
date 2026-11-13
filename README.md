@@ -2,6 +2,7 @@
 
 An LLM inference engine for AI agents that decides, at each tool call, whether to keep, swap or drop the agent's KV cache.
 
+[![CI](https://github.com/CarlGergi/Layover/actions/workflows/ci.yml/badge.svg)](https://github.com/CarlGergi/Layover/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.15-EE4C2C?logo=pytorch&logoColor=white)
 ![Triton](https://img.shields.io/badge/Triton-3.9-5A5A5A)
@@ -203,6 +204,7 @@ On this card swapping beats recomputing at every length measured, by 15 to 52×.
 | Kernels | Triton decode against a PyTorch reference: in Triton's interpreter on Linux (`make test-docker`) and compiled on the L4. CUDA transfers against the host build. | Every custom kernel under compute-sanitizer: **memcheck 0 errors, racecheck 0 hazards** (`make sanitize`) |
 | Benchmarks | The whole matrix pipeline runs on CPU against stub servers, and every published number comes from `make reproduce` | GPU smoke on the L4: 10 of 10 checks passed (reference parity, Triton decode, native transfer, server session, GPU tests) before any matrix time was spent |
 | Remote runner | Tests against a stub machine, including the self-stop timers; end-to-end over real SSH into a container with `LAYOVER_DOCKER_E2E=1` | 243 passing, 10 end-to-end opt-in |
+| Continuous integration | GitHub Actions on every push: `ruff check` and the CPU suite on Linux with Triton's interpreter, offline (tests that download weights are skipped) | `.github/workflows/ci.yml` |
 | Whole suite on a Mac | `make test` | 1,081 passing; 61 skipped (GPU-only or opt-in end-to-end) |
 
 Before a run is accepted, every server's KV pool, GPU memory and CPU tier are read back from the server itself and checked against the matched budget. A run that is off budget fails rather than being reported.

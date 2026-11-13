@@ -61,7 +61,7 @@ sys.path.insert(0, str(REPO))
 
 from bench.gpu_sampler import GIB, GpuSampler, NvmlBackend  # noqa: E402
 from bench.systems import (  # noqa: E402
-    BLOCK_TOKENS, BudgetMismatch, GpuNotReleased, ManagedServer, MatchedSettings, ServerFailed, System, build_system,
+    BLOCK_TOKENS, GpuNotReleased, ManagedServer, MatchedSettings, ServerFailed, System, build_system,
     check_cpu_tier, check_gpu_memory, check_kv_capacity, offload_record_bytes, wait_gpu_released,
 )
 from layover.config import ModelConfig  # noqa: E402

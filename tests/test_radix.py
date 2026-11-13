@@ -1,7 +1,7 @@
 """Radix tree against a dictionary model and an LRU free queue, and copy-on-write through real blocks."""
 
 import torch
-from hypothesis import given, settings
+from hypothesis import settings
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, invariant, rule
 

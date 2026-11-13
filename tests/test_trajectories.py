@@ -138,6 +138,7 @@ def template_ids(tokenizer, raw):
     return tokenizer.encode(rendered[: -len(closing)], add_special_tokens=False)
 
 
+@pytest.mark.weights
 def test_counts_add_up_to_one_render_of_the_real_template(tokenizer, accounting):
     raw = trajectory()
     counts = count_tokens(parse(raw), accounting)
@@ -147,6 +148,7 @@ def test_counts_add_up_to_one_render_of_the_real_template(tokenizer, accounting)
     assert len(counts.new_tokens) == len(counts.output_tokens) == 3 and min(counts.output_tokens) > 0
 
 
+@pytest.mark.weights
 def test_each_piece_is_framed_as_the_replayer_appends_it(accounting):
     parsed = parse(trajectory())
     first, second, third = parsed.turns
@@ -162,6 +164,7 @@ def test_each_piece_is_framed_as_the_replayer_appends_it(accounting):
     assert accounting.following_text(third) == "\n<|im_start|>assistant\n"
 
 
+@pytest.mark.weights
 def test_reasoning_stays_in_the_context_when_a_later_user_message_appears(accounting):
     """A single render would drop it; the append-only context does not."""
     raw = trajectory()
@@ -173,6 +176,7 @@ def test_reasoning_stays_in_the_context_when_a_later_user_message_appears(accoun
     assert counted.new_tokens[1] > plain.new_tokens[1]
 
 
+@pytest.mark.weights
 def test_context_is_monotonic_and_prepared_files_keep_only_whitelisted_environment(accounting):
     parsed = parse(trajectory())
     counts = count_tokens(parsed, accounting)
@@ -250,6 +254,7 @@ def run_prepare(tmp_path, tokenizer, name="a", bucket=None, **kwargs):
     return prepare(SUBMISSION, tmp_path / name / "prepared", tmp_path / name / "raw", tokenizer, get=bucket or Bucket(fleet()), **arguments)
 
 
+@pytest.mark.weights
 def test_selection_is_deterministic_and_ignores_listing_order(tmp_path, tokenizer):
     one = run_prepare(tmp_path, tokenizer, "a")
     two = run_prepare(tmp_path, tokenizer, "b", Bucket(fleet(), reverse_listing=True))
@@ -259,6 +264,7 @@ def test_selection_is_deterministic_and_ignores_listing_order(tmp_path, tokenize
     assert len(one["tasks"]) == 4 and len(one["reserves"]) == 2
 
 
+@pytest.mark.weights
 def test_manifest_records_exclusions_and_provenance(tmp_path, tokenizer):
     files = fleet()
     manifest = run_prepare(tmp_path, tokenizer, bucket=Bucket(files), tasks=8, reserves=0)
@@ -274,6 +280,7 @@ def test_manifest_records_exclusions_and_provenance(tmp_path, tokenizer):
     assert saved["tasks"] == manifest["tasks"]
 
 
+@pytest.mark.weights
 def test_context_limit_is_exclusive(tmp_path, tokenizer):
     files = {"r__r-1": trajectory("r__r-1"), "r__r-2": trajectory("r__r-2")}
     peak = count_tokens(parse(files["r__r-1"]), Accounting(tokenizer)).peak_context
@@ -283,6 +290,7 @@ def test_context_limit_is_exclusive(tmp_path, tokenizer):
     assert over["tasks"] == [] and over["exclusion_counts"] == {"context_over_limit": 2}
 
 
+@pytest.mark.weights
 def test_shared_prefix_is_a_true_common_token_prefix(tmp_path, tokenizer):
     manifest = run_prepare(tmp_path, tokenizer)
     accounting = Accounting(tokenizer)
@@ -297,6 +305,7 @@ def test_shared_prefix_is_a_true_common_token_prefix(tmp_path, tokenizer):
     assert len({p[prefix] for p in prompts}) > 1  # Task text differs right after it.
 
 
+@pytest.mark.weights
 def test_named_instances_are_marked_and_not_seeded(tmp_path, tokenizer):
     manifest = run_prepare(tmp_path, tokenizer, instances=["r__r-2"])
     assert manifest["tasks"] == ["r__r-2"] and manifest["reserves"] == [] and manifest["selection"] == "named"
@@ -304,6 +313,7 @@ def test_named_instances_are_marked_and_not_seeded(tmp_path, tokenizer):
         run_prepare(tmp_path, tokenizer, "b", instances=["missing__task-1"])
 
 
+@pytest.mark.weights
 def test_a_network_failure_stops_prepare_rather_than_excluding(tmp_path, tokenizer):
     bucket = Bucket(fleet())
 
@@ -316,6 +326,7 @@ def test_a_network_failure_stops_prepare_rather_than_excluding(tmp_path, tokeniz
         run_prepare(tmp_path, tokenizer, bucket=flaky)
 
 
+@pytest.mark.weights
 def test_prepare_refuses_a_submission_that_did_not_resend_reasoning(tmp_path, tokenizer, monkeypatch):
     monkeypatch.setattr(tj, "reasoning_evidence", lambda pairs: {"conclusion": "not_resent"})
     with pytest.raises(RuntimeError, match="did not re-send"):
@@ -360,6 +371,7 @@ def test_tokenizer_fetch_excludes_weights(monkeypatch):
     assert seen["revision"] == "abc" and not any("safetensors" in p or p == "*" for p in seen["patterns"])
 
 
+@pytest.mark.weights
 def test_estimate_uses_registry_sizes_and_recorded_gaps(tmp_path, tokenizer):
     bucket = Bucket(fleet())
     run_prepare(tmp_path, tokenizer, bucket=bucket, tasks=2, reserves=1)

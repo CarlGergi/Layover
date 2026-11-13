@@ -265,6 +265,7 @@ def test_environment_needs_a_gpu_and_a_gpu_build_of_torch(monkeypatch, tmp_path)
         smoke.check_environment(context(tmp_path))
 
 
+@pytest.mark.weights
 def test_parity_on_real_weights_and_that_it_can_fail(monkeypatch, tmp_path, checkpoint):
     """The check itself, on the small checkpoint and the CPU."""
     from layover.model import Qwen3
@@ -292,6 +293,7 @@ def test_triton_on_real_kv_and_that_the_comparison_can_fail(monkeypatch, checkpo
     assert attention > 1 and logits > 1
 
 
+@pytest.mark.weights
 def test_the_server_gets_the_matrix_flags_and_the_smokes_cost_model(tmp_path):
     system, _ = smoke.matrix_system(context(tmp_path))
     command = system.command("127.0.0.1", 9)
@@ -303,6 +305,7 @@ def test_the_server_gets_the_matrix_flags_and_the_smokes_cost_model(tmp_path):
     assert flags["--prefill-chunk"] == str(matched["prefill_chunk"]) and "--no-prefix-cache" not in command
 
 
+@pytest.mark.weights
 def test_the_server_runs_at_the_settings_of_the_plan_being_priced(tmp_path):
     def cpu_tier(plan):
         ctx = Context("cuda", "Qwen/Qwen3-4B", str(smoke.DEFAULT_CONFIG), str(tmp_path), str(tmp_path), plan)
@@ -313,6 +316,7 @@ def test_the_server_runs_at_the_settings_of_the_plan_being_priced(tmp_path):
     assert cpu_tier("runpod-l4") == 24.0
 
 
+@pytest.mark.weights
 def test_a_matrix_off_the_native_path_is_refused(tmp_path):
     config = real_config()
     config["layover"]["transfer"] = "plain"
@@ -415,6 +419,7 @@ def test_refine_plan_fails_when_the_dry_run_does(monkeypatch, tmp_path):
         smoke.check_refine_plan(context(tmp_path))
 
 
+@pytest.mark.weights
 def test_refined_hours_through_the_real_dry_run_of_the_real_plan(tmp_path):
     (tmp_path / "measured_rates.json").write_text(json.dumps(smoke.measured_rates(MEASURED, True)))
     details = smoke.check_refine_plan(context(tmp_path))
@@ -472,6 +477,7 @@ def test_each_way_a_session_can_go_wrong_is_named(changes, needle):
     assert found and any(needle in problem for problem in found), found
 
 
+@pytest.mark.weights
 def test_the_session_on_a_real_server_goes_through_keep_swap_and_restore(tmp_path, checkpoint):
     """Real weights, the real server through its real flags, and real /metrics, on the host build."""
     from bench.systems import MatchedSettings, build_system, offload_record_bytes

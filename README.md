@@ -10,6 +10,7 @@ An LLM inference engine for AI agents that decides, at each tool call, whether t
 ![GPU](https://img.shields.io/badge/GPU-NVIDIA%20L4-76B900?logo=nvidia&logoColor=white)
 ![Cloud](https://img.shields.io/badge/cloud-RunPod-673AB7)
 ![Model](https://img.shields.io/badge/model-Qwen3--4B-1f6feb)
+![License: MIT](https://img.shields.io/badge/license-MIT-blue)
 
 ![Mean job completion time for three systems on the same agent workload: layover-combined 30.6 minutes, vLLM 15.9 minutes, layover-discard 46.1 minutes, each with two runs marked as dots.](docs/images/matrix_jct.png)
 
@@ -335,4 +336,4 @@ No code is taken from these systems.
 
 ## License
 
-No license has been chosen yet; all rights reserved.
+MIT, copyright Carl Gergi. See [LICENSE](LICENSE).

@@ -14,6 +14,7 @@ import argparse
 import csv
 import json
 import math
+import random
 import statistics
 import sys
 from dataclasses import dataclass
@@ -324,6 +325,43 @@ def paired_ratio(ours: dict[int, float], theirs: dict[int, float]) -> float | No
     return statistics.median(ratios) if ratios else None
 
 
+def _jobs_by_run(runs: dict, workload: str, system: str, load: str) -> dict[int, dict[str, float]]:
+    """Each finished run's per-job completion times, by run index."""
+    return {
+        run: record["result"]["jct_s"]
+        for (w, s, l, run), record in runs.items()
+        if (w, s, l) == (workload, system, load) and record.get("status") == "ok" and record.get("result", {}).get("jct_s")
+    }
+
+
+def paired_job_interval(
+    ours: dict[int, dict[str, float]], theirs: dict[int, dict[str, float]], draws: int = 10_000, level: float = 0.95, seed: int = 0
+) -> tuple[float, float, float, int] | None:
+    """Ratio of mean job time, with a percentile bootstrap interval over jobs paired by seed and task.
+
+    The same seed replays the same jobs at the same arrival times on every system, so a job is
+    compared with itself. Resampling the pairs, not each side alone, keeps that pairing. Jobs of
+    one run share a server and are not independent, so this interval is narrower than one over
+    many runs would be; it is read beside the per-run range, not instead of it.
+    """
+    pairs = [
+        (ours[run][job], theirs[run][job])
+        for run in sorted(set(ours) & set(theirs))
+        for job in sorted(set(ours[run]) & set(theirs[run]))
+    ]
+    if not pairs or sum(t for _, t in pairs) <= 0:
+        return None
+    rng = random.Random(seed)
+    ratios = []
+    for _ in range(draws):
+        sample = rng.choices(pairs, k=len(pairs))
+        ratios.append(sum(o for o, _ in sample) / sum(t for _, t in sample))
+    ratios.sort()
+    tail = (1 - level) / 2
+    low, high = ratios[int(tail * (draws - 1))], ratios[int((1 - tail) * (draws - 1))]
+    return sum(o for o, _ in pairs) / sum(t for _, t in pairs), low, high, len(pairs)
+
+
 def ablation_table(manifest: dict, runs: dict, workload: dict, reference: str, load: str = DEFAULT_LOAD) -> list[str]:
     """Each system against the reference, run by run, for the same workload and load."""
     name = workload["name"]
@@ -337,11 +375,15 @@ def ablation_table(manifest: dict, runs: dict, workload: dict, reference: str, l
     lines.append(
         "Median of per-run ratios: each run is divided by the reference's run with the same seed, over the seeds both have, "
         "listed in the table, however many more the reference ran. 1.00 is the reference. Above 1 is more time, except Programs/hour, where it is more work. "
-        "A ratio marked with * is against a baseline with no evidence its CPU tier returned anything; see CPU tier evidence."
+        "A ratio marked with * is against a baseline with no evidence its CPU tier returned anything; see CPU tier evidence. "
+        "The last column is the ratio of mean job time over all paired jobs, with a 95% bootstrap interval that resamples "
+        "jobs paired by seed and task. Jobs in one run share a server, so they are not independent and this interval is "
+        "narrower than one across many runs; read it beside the per-run ranges in the results table."
     )
     lines.append("")
-    lines.append("| System | Runs | Seeds compared | " + " | ".join(labels[key] for key in keys) + " |")
-    lines.append("| --- | --- | --- | " + " | ".join("---" for _ in keys) + " |")
+    lines.append("| System | Runs | Seeds compared | " + " | ".join(labels[key] for key in keys) + " | Mean JCT over paired jobs, 95% CI |")
+    lines.append("| --- | --- | --- | " + " | ".join("---" for _ in keys) + " | --- |")
+    reference_jobs = _jobs_by_run(runs, name, reference, load)
     for system in systems:
         cells = []
         mark = "*" if tier_flag(manifest, runs, workload, system, load) else ""
@@ -352,6 +394,8 @@ def ablation_table(manifest: dict, runs: dict, workload: dict, reference: str, l
         shared = sorted(set(ours) & set(_by_run(runs, name, reference, "mean_jct_s", load)))
         # Old records name no seed, and the run index still says which pairs were compared.
         seeds = ", ".join(str(runs[(name, system, load, run)].get("seed", f"run {run}")) for run in shared) or "none shared"
+        interval = paired_job_interval(_jobs_by_run(runs, name, system, load), reference_jobs)
+        cells.append("n/a" if interval is None else f"{interval[0]:.2f}{mark} ({interval[1]:.2f} to {interval[2]:.2f}, {interval[3]} jobs)")
         lines.append(f"| {_system_cell(manifest, runs, workload, system, load)} | {len(ours)}/{expected_runs(manifest, name, system, load)} | {seeds} | " + " | ".join(cells) + " |")
     lines.append("")
     return lines

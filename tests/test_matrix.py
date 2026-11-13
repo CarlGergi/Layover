@@ -8,6 +8,8 @@ when asked for through return_token_ids.
 
 import argparse
 import json
+import statistics
+import random
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -2805,6 +2807,45 @@ def test_a_reference_with_fewer_runs_or_no_shared_seed_is_paired_or_says_so():
     assert "| vllm | 3/1 | 1001 | 3.00 |" in "\n".join(report.ablation_table(manifest, runs, workload, "layover-combined"))
     del runs[("w", "vllm", "load100", 1)]
     assert "| vllm | 2/1 | none shared | n/a |" in "\n".join(report.ablation_table(manifest, runs, workload, "layover-combined"))
+
+
+
+def jobs_run(seed: int, jct: dict[str, float]) -> dict:
+    return {"status": "ok", "seed": seed, "result": {**fake_result(statistics.fmean(jct.values())), "jct_s": jct}}
+
+
+def test_the_job_interval_pairs_each_job_with_itself_and_covers_the_ratio():
+    # Jobs vary 100-fold, but each takes exactly twice as long on one system: the pairing removes the spread.
+    ref = {0: {"a": 10.0, "b": 1000.0, "c": 50.0}, 1: {"a": 20.0, "b": 500.0}}
+    ours = {run: {job: 2 * t for job, t in jobs.items()} for run, jobs in ref.items()}
+    point, low, high, n = report.paired_job_interval(ours, ref, draws=2000)
+    assert (round(point, 9), round(low, 9), round(high, 9), n) == (2.0, 2.0, 2.0, 5)
+    # Only jobs and runs both sides have are paired.
+    assert report.paired_job_interval({0: {"a": 30.0, "z": 1.0}, 7: {"a": 1.0}}, ref)[3] == 1
+    assert report.paired_job_interval({5: {"a": 1.0}}, ref) is None
+
+
+def test_the_job_interval_widens_with_noise_and_holds_the_point_estimate():
+    rng = random.Random(1)
+    ref = {run: {f"j{i}": rng.uniform(100, 1000) for i in range(10)} for run in range(2)}
+    ours = {run: {job: t * rng.uniform(1.2, 1.8) for job, t in jobs.items()} for run, jobs in ref.items()}
+    point, low, high, n = report.paired_job_interval(ours, ref)
+    assert n == 20 and low < point < high and 1.2 < low and high < 1.8
+    assert report.paired_job_interval(ours, ref) == (point, low, high, n)  # seeded, so reproducible
+
+
+def test_the_ablation_table_gives_the_job_interval_or_says_there_is_none():
+    manifest = tier_manifest(systems=("layover-combined", "vllm"))
+    workload = manifest["workloads"][0]
+    hits = {"vllm:external_prefix_cache_hits_total": 5}
+    runs = {("w", "layover-combined", "load100", 0): jobs_run(1000, {"a": 100.0, "b": 300.0})}
+    vllm = jobs_run(1000, {"a": 50.0, "b": 150.0})
+    runs[("w", "vllm", "load100", 0)] = {**vllm, "result": {**vllm["result"], "server_metrics": hits}}
+    table = "\n".join(report.ablation_table(manifest, runs, workload, "layover-combined"))
+    assert "Mean JCT over paired jobs, 95% CI" in table and "0.50 (0.50 to 0.50, 2 jobs) |" in table
+    assert "not independent" in table
+    del runs[("w", "vllm", "load100", 0)]["result"]["jct_s"]
+    assert "| n/a |" in "\n".join(report.ablation_table(manifest, runs, workload, "layover-combined"))
 
 
 # ---- a system that keeps failing --------------------------------------------------------------------

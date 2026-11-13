@@ -301,6 +301,8 @@ The headline benchmark uses real agent trajectories: 30 tasks from a public [SWE
 
    Fidelity of the final set: median return-code match 1.00, median output similarity 0.93, and 30 of 30 patches matched.
 
+The published trace was re-executed on a plain x86 machine with Docker and no GPU (an AWS `m7i-flex.large`), with `scripts/remote_traces.sh user@host -i key` (`--status`, then `--fetch`); the machine shuts itself down 4 hours after the start whatever happens.
+
 **Selection effect.** Re-execution replaced 9 of the first 30 tasks, mostly the slow ones. The selected set's recorded tool time fell from 2,299 s to 1,516 s, and re-executed it spends 480 s in tools over 1,272 turns. About 54% of that is install and download commands. Short tool calls favor keeping KV over swapping or dropping it, so these results say little about agents whose tools run for minutes.
 
 The matrix replays the first 15 tasks. Synthetic traces (`python -m layover.replay generate`) exist only for parameter sweeps.

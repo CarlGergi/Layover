@@ -22,7 +22,8 @@ pytestmark = pytest.mark.skipif(
 FAKE_SSH = """#!/usr/bin/env bash
 while [ $# -gt 0 ]; do
     case "$1" in
-        -o|-i|-p) shift 2 ;;
+        # Linux rsync splits user@host into -l user host.
+        -o|-i|-p|-l) shift 2 ;;
         -*) shift ;;
         *) echo "$1" >> "$REMOTE_HOME/hosts.log"; shift; break ;;
     esac

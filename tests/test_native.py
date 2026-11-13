@@ -5,6 +5,7 @@ import importlib.util
 import mmap
 import random
 import subprocess
+import sys
 import time
 import zlib
 from pathlib import Path
@@ -378,12 +379,11 @@ def test_c_checks_pass_under_address_and_undefined_sanitizers():
 
 def test_sanitize_driver_passes_on_cpu():
     done = subprocess.run(
-        ["python", str(ROOT / "tests" / "sanitize_transfer.py"), "--device", "cpu"],
+        [sys.executable, str(ROOT / "tests" / "sanitize_transfer.py"), "--device", "cpu"],
         capture_output=True,
         text=True,
         timeout=300,
         cwd=ROOT,
-        executable=__import__("sys").executable,
     )
     assert done.returncode == 0, done.stderr[-3000:]
     assert "ok" in done.stdout
@@ -391,12 +391,11 @@ def test_sanitize_driver_passes_on_cpu():
 
 def test_sanitize_driver_exits_non_zero_on_mismatch():
     done = subprocess.run(
-        ["python", str(ROOT / "tests" / "sanitize_transfer.py"), "--device", "cpu", "--corrupt"],
+        [sys.executable, str(ROOT / "tests" / "sanitize_transfer.py"), "--device", "cpu", "--corrupt"],
         capture_output=True,
         text=True,
         timeout=300,
         cwd=ROOT,
-        executable=__import__("sys").executable,
     )
     assert done.returncode != 0
     assert "mismatch" in done.stderr

@@ -1982,7 +1982,7 @@ def test_real_tree_keeps_its_private_files_home():
     paths = [line.split(maxsplit=4)[-1] for line in listing.splitlines() if line.strip()]
     names = {path.split("/")[0] for path in paths}
     patterns = {line.strip().rstrip("/") for line in exclude.read_text().splitlines() if line.strip() and not line.startswith("#")}
-    assert patterns
+    # A fresh clone, as in CI, lists none; the runner's own rules still apply to it.
     assert not names & (patterns | {".git", ".venv", ".notes", ".hypothesis", "results"})
     assert not any("__pycache__" in path or path.startswith("native/build") for path in paths)
     assert "scripts" in names and "Makefile" in names and "layover" in names

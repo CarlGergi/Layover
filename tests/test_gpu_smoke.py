@@ -278,6 +278,7 @@ def test_parity_on_real_weights_and_that_it_can_fail(monkeypatch, tmp_path, chec
         smoke.check_reference_parity(ctx)
 
 
+@pytest.mark.weights
 def test_triton_on_real_kv_and_that_the_comparison_can_fail(monkeypatch, checkpoint):
     """The comparison itself, in Triton's interpreter on the small checkpoint, where Triton installs."""
     pytest.importorskip("triton")

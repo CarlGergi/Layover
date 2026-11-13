@@ -223,7 +223,15 @@ cancel_pod_stop() {
 stop_pod_after() {
     echo $$ > "$STATE/stop_timer.pid"
     printf '%s %s\n' "$1" "$2" > "$STATE/stop_timer"
-    sleep $(($1 * 60))
+    # The sleep in the background, so that a TERM reaches this shell during the wait and takes the
+    # sleep with it. Without setsid (macOS) a cancel signals only this shell, which would otherwise
+    # leave the sleep behind for days.
+    local sleeper
+    trap 'kill "$sleeper" 2>/dev/null; exit 0' TERM INT HUP
+    sleep $(($1 * 60)) &
+    sleeper=$!
+    wait "$sleeper"
+    trap - TERM INT HUP
     runpod_env
     echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') stopping pod ${RUNPOD_POD_ID:-unknown}: $2"
     rm -f "$STATE/stop_timer.pid"

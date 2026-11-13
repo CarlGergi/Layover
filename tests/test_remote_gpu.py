@@ -211,6 +211,20 @@ def build_repo(repo):
         (repo / name).write_text(text)
 
 
+def kill_tree(pid):
+    """A process and everything under it, children first collected, so that no sleep outlives a test."""
+    tree, frontier = [pid], [pid]
+    while frontier:
+        found = subprocess.run(["pgrep", "-P", str(frontier.pop())], capture_output=True, text=True).stdout.split()
+        tree += map(int, found)
+        frontier += map(int, found)
+    for member in tree:
+        try:
+            os.kill(member, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 class World:
     """A repository, a fake remote home, and shims that connect them."""
 
@@ -343,8 +357,8 @@ exec {shlex.quote(real_rsync)} "${{args[@]}}"
             pid_file = self.state / name
             if pid_file.exists():
                 try:
-                    os.kill(int(pid_file.read_text()), signal.SIGKILL)
-                except (ProcessLookupError, ValueError):
+                    kill_tree(int(pid_file.read_text()))
+                except ValueError:
                     pass
 
 
@@ -1040,7 +1054,9 @@ def test_an_instance_that_vanishes_is_reported_with_the_command_to_resume(world)
     world.control("hold-reproduce")
     process = world.start("--reconnect-timeout", "1", "--fetch-every-runs", "0", "--hourly-usd", "1.5", "-i", str(key), "--from", "setup")
     world.wait_for_stage("reproduce")
-    # A fetch brings the stage markers last, so this one means the copy is whole.
+    # The marker goes up just before the stage writes anything, so a fetch can bring the marker
+    # without the stage's first file: wait for that file itself, then for a fetch after it.
+    wait_for_session_file(world, "results/reproduce/partial.txt")
     wait_for_session_file(world, "stages/reproduce")
     world.ssh_down.write_text("")
     output, _ = process.communicate(timeout=HEAD_TIMEOUT)
@@ -2842,6 +2858,8 @@ def test_the_pods_timer_stops_it_and_a_newer_one_replaces_it(world):
         for _ in range(100):
             os.kill(dead_man, 0)
             time.sleep(0.05)
+    # The firings below take over the pid file, so the run's own timer goes now, not after its minute.
+    kill_tree(int((world.state / "stop_timer.pid").read_text()))
     # What a timer does when it fires, with the commands of either version of runpodctl.
     for marker, expected in ((None, "pod stop pod123"), ("runpodctl-v1", "stop pod pod123")):
         if marker:
